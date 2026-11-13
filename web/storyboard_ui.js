@@ -11,7 +11,7 @@ import {
   parseFrameName,
   parseStoryboard,
   summarize,
-} from "./storyboard_parser.js?v=20261113a";
+} from "./storyboard_parser.js?v=20261113e";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -63,11 +63,11 @@ import {
   writePlanPromptPrefix,
   writeRuleBridgeText,
   writeH3Shot,
-} from "./storyboard_bridge.js?v=20261113c";
+} from "./storyboard_bridge.js?v=20261113e";
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 2;
-const PANEL_VERSION = `v53.5 · 缓存修复 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.6 · 换入口 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
