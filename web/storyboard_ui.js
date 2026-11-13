@@ -64,7 +64,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 2;
-const PANEL_VERSION = `v52 · 手动更新 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53 · 上传进度 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -136,6 +136,12 @@ const CSS = `
 .sb-rule textarea:focus{outline:none;border-color:var(--sb-accent);}
 .sb-paste-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
 .sb-hint{color:var(--sb-muted);font-size:10.5px;}
+.sb-upload{margin:6px 0 2px;padding:7px 8px;border:1px solid var(--sb-line);border-radius:6px;background:var(--sb-card);}
+.sb-upload-meta{display:flex;align-items:baseline;gap:8px;margin-bottom:5px;font-size:10.5px;}
+.sb-upload-meta span:first-child{color:var(--sb-fg);font-weight:500;}
+.sb-upload-track{height:6px;border-radius:3px;background:rgba(127,127,127,.22);overflow:hidden;}
+.sb-upload-fill{height:100%;width:0;border-radius:3px;background:var(--sb-accent);transition:width .18s ease;}
+.sb-upload.done .sb-upload-fill{background:#22c55e;}
 .sb-ready{
   display:flex;align-items:center;gap:6px;margin:0 10px 8px;padding:6px 8px;border-radius:7px;
   border:1px solid var(--sb-line);background:var(--sb-card);font-size:10.5px;color:var(--sb-muted);
@@ -319,8 +325,6 @@ function loadState() {
       saved.draftBase && typeof saved.draftBase === "object" && saved.draftBase.width && saved.draftBase.height
         ? saved.draftBase
         : null,
-    // 素材库只在本次会话有效：刷新后必须重新选文件夹，避免删了文件还显示旧素材
-    library: { files: [], importedAt: 0 },
     settings: {
       ...DEFAULT_SETTINGS,
       ...settings,
@@ -368,6 +372,38 @@ function renderTierTable(params) {
   return `<table class="sb-tier-table">${head}${body}</table>`;
 }
 
+const LIBRARY_KEY = "comfy.storyboard.library.v1";
+
+/**
+ * 素材库放在模块作用域：切换侧栏页签会重建面板实例，
+ * 文件句柄、上传进度都必须活过重建，否则上传承接会被打断、素材库变空。
+ */
+const libraryStore = loadLibraryStore();
+const fileHandles = new Map();
+let librarySync = null; // { total, done, uploaded, failed, running }
+let libraryListener = () => {};
+
+function loadLibraryStore() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LIBRARY_KEY) || "{}") || {};
+    const files = Array.isArray(saved.files) ? saved.files.filter((entry) => entry && entry.name) : [];
+    return { files, importedAt: Number(saved.importedAt) || 0 };
+  } catch (error) {
+    return { files: [], importedAt: 0 };
+  }
+}
+
+function saveLibraryStore() {
+  try {
+    localStorage.setItem(
+      LIBRARY_KEY,
+      JSON.stringify({ files: libraryStore.files, importedAt: libraryStore.importedAt })
+    );
+  } catch (error) {
+    /* 本地存储写满时只保留内存里的素材库 */
+  }
+}
+
 export function createStoryboardPanel(root, app) {
   injectStyle();
 
@@ -375,7 +411,6 @@ export function createStoryboardPanel(root, app) {
   if (state.raw) {
     state.doc = parseStoryboard(state.raw);
   }
-  const fileHandles = new Map();
 
   let searchTimer = null;
   let toastTimer = null;
@@ -569,6 +604,9 @@ export function createStoryboardPanel(root, app) {
 
   el.text.value = state.raw;
 
+  // 上传可能由上一个面板实例发起：重建后把进度接回当前实例
+  libraryListener = () => setLibraryStatus();
+
   function persist() {
     try {
       localStorage.setItem(
@@ -639,7 +677,7 @@ export function createStoryboardPanel(root, app) {
     }
     const stats = summarize(state.doc);
     el.summary.textContent = `${state.doc.scenes.length} 场 · ${stats.total} 单元（A ${stats.A} / B ${stats.B} / C ${stats.C}）`;
-    const libraryCount = (state.library && state.library.files.length) || 0;
+    const libraryCount = libraryFiles().filter((entry) => !entry.audio).length;
     if (libraryCount) el.summary.textContent += ` · 素材库 ${libraryCount} 张图片`;
   }
 
@@ -793,17 +831,29 @@ export function createStoryboardPanel(root, app) {
         <button class="sb-btn" data-act="clear-library">清空素材库</button>
         <span class="sb-hint grow">「清空参考位」会关掉当前工作流里所有参考图/首尾帧加载窗口；「清空素材库」还会移除面板创建的参考图节点。</span>
       </div>
+      ${
+        libraryFiles().length
+          ? `<div class="sb-upload" data-el="upload-progress" hidden>
+               <div class="sb-upload-meta">
+                 <span data-el="upload-text">已上传 0 / 0 个</span>
+                 <span class="sb-hint grow">图片和音频一起算，上传中断或切页都不会停</span>
+               </div>
+               <div class="sb-upload-track"><div class="sb-upload-fill" data-el="upload-fill"></div></div>
+             </div>`
+          : ""
+      }
       <div class="sb-hint">注意：要让参考图真正进入画面，工作流的条件节点必须是 Ref2VA（如 MiniMax H3 Tagged Reference to Video）；纯 ImageToVideo 只能当首帧用。</div>
       ${
         libraryCount
-          ? '<div class="sb-hint">素材库只在本次会话有效：刷新页面后需要重新点「素材库」选择文件夹。</div>'
+          ? '<div class="sb-hint">素材库会记住文件清单和已上传状态：切页、刷新后不用重新选文件夹；只有尚未上传成功的文件需要重新点「素材库」选文件夹补传。</div>'
           : ""
       }
     `;
+    setLibraryStatus();
   }
 
   function libraryFiles() {
-    return (state.library && state.library.files) || [];
+    return libraryStore.files;
   }
 
   function libraryMatches(unit) {
@@ -901,7 +951,11 @@ export function createStoryboardPanel(root, app) {
       });
       noteCount += 1;
     }
-    state.library = { files: [...entries, ...audioEntries], importedAt: Date.now() };
+    libraryStore.files = [...entries, ...audioEntries];
+    libraryStore.importedAt = Date.now();
+    if (librarySync && librarySync.running) librarySync.cancelled = true;
+    librarySync = null;
+    saveLibraryStore();
     // 换了素材文件夹：丢掉指向旧文件的首帧选择
     Object.keys(state.images || {}).forEach((unitId) => {
       const base = String(state.images[unitId] || "")
@@ -1108,10 +1162,13 @@ export function createStoryboardPanel(root, app) {
   /** 清空素材库，并移除面板创建的参考图节点与加载图像 */
   function clearLibraryAndRefs() {
     const removed = removeReferenceNodes(app);
-    state.library = { files: [], importedAt: 0 };
+    libraryStore.files = [];
+    libraryStore.importedAt = 0;
+    librarySync = null;
     state.tags = {};
     state.images = {};
     fileHandles.clear();
+    saveLibraryStore();
     persist();
     renderAll();
     const tail = removed.nodes
@@ -1881,6 +1938,8 @@ export function createStoryboardPanel(root, app) {
     libraryFiles().forEach((entry) => {
       entry.uploadedName = "";
     });
+    librarySync = null;
+    saveLibraryStore();
     persist();
   }
 
@@ -1911,14 +1970,15 @@ export function createStoryboardPanel(root, app) {
       const name = data && data.name ? (data.subfolder ? `${data.subfolder}/${data.name}` : data.name) : "";
       if (!name) return null;
       entry.uploadedName = name;
-      if (persistNow) persist();
+      if (persistNow) {
+        saveLibraryStore();
+        persist();
+      }
       return name;
     } catch (error) {
       return null;
     }
   }
-
-  let librarySync = null; // { total, done, uploaded, failed, running }
 
   function libraryStatusText() {
     const entries = libraryFiles().filter((entry) => entry.image || entry.audio);
@@ -1934,31 +1994,57 @@ export function createStoryboardPanel(root, app) {
       : `已上传 ${uploaded}/${entries.length} 个；点「上传素材」补齐`;
   }
 
+  /** 状态文字 + 上传进度条；元素可能被重建，所以每次都从 root 重新取 */
   function setLibraryStatus() {
     const node = root.querySelector('[data-el="library-text"]');
     if (node) node.textContent = libraryStatusText();
+    const wrap = root.querySelector('[data-el="upload-progress"]');
+    if (!wrap) return;
+    const entries = libraryFiles().filter((entry) => entry.image || entry.audio);
+    if (!entries.length) {
+      wrap.hidden = true;
+      return;
+    }
+    const total = entries.length;
+    const uploaded = entries.filter((entry) => entry.uploadedName).length;
+    const done = librarySync ? Math.max(librarySync.done, uploaded) : uploaded;
+    const percent = total ? Math.round((done / total) * 100) : 0;
+    wrap.hidden = false;
+    wrap.classList.toggle("done", percent >= 100);
+    const text = wrap.querySelector('[data-el="upload-text"]');
+    if (text) {
+      const failed = librarySync && librarySync.failed ? librarySync.failed : 0;
+      text.textContent = `已上传 ${uploaded} / ${total} 个${failed ? ` · 失败 ${failed}` : ""}`;
+    }
+    const fill = wrap.querySelector('[data-el="upload-fill"]');
+    if (fill) fill.style.width = `${percent}%`;
   }
 
   /** 选完素材文件夹就整批传进 ComfyUI 的 input 目录：之后刷新页面也能直接用 */
   async function syncLibraryToComfy() {
-    if (librarySync && librarySync.running) return;
+    if (librarySync && librarySync.running) {
+      toast("素材正在上传中，完成时会有提示", "ok");
+      return;
+    }
     const entries = libraryFiles().filter((entry) => entry.image || entry.audio);
     if (!entries.length) {
       toast("素材库是空的：先点「素材库」选文件夹", "err");
       return;
     }
     const pending = entries.filter((entry) => !entry.uploadedName);
-    librarySync = {
+    const job = {
       total: entries.length,
       done: entries.length - pending.length,
       uploaded: entries.length - pending.length,
       failed: 0,
       running: true,
+      cancelled: false,
     };
-    setLibraryStatus();
+    librarySync = job;
+    libraryListener();
     if (!pending.length) {
-      librarySync.running = false;
-      setLibraryStatus();
+      job.running = false;
+      libraryListener();
       renderAssets();
       toast(`素材已经在 ComfyUI input 里（${entries.length} 个），不用重复上传`, "ok");
       return;
@@ -1968,29 +2054,35 @@ export function createStoryboardPanel(root, app) {
       while (cursor < pending.length) {
         const entry = pending[cursor];
         cursor += 1;
+        if (job.cancelled) return;
         if (!fileHandles.has(entry.path)) {
-          librarySync.failed += 1;
+          job.failed += 1;
         } else {
           const name = await uploadAsset(entry, false);
-          if (name) librarySync.uploaded += 1;
-          else librarySync.failed += 1;
+          if (name) job.uploaded += 1;
+          else job.failed += 1;
         }
-        librarySync.done += 1;
-        if (librarySync.done % 3 === 0 || librarySync.done === librarySync.total) setLibraryStatus();
+        job.done += 1;
+        if (job.done % 3 === 0 || job.done === job.total) {
+          saveLibraryStore();
+          libraryListener();
+        }
       }
     };
     try {
       await Promise.all([worker(), worker(), worker(), worker()]);
     } finally {
-      librarySync.running = false;
-      persist();
+      job.running = false;
+      saveLibraryStore();
+      libraryListener();
       renderAssets();
-      setLibraryStatus();
-      const { uploaded, failed, total } = librarySync;
-      toast(
-        `素材已上传 ${uploaded}/${total} 个到 ComfyUI input${failed ? `，${failed} 个失败（文件不在本次会话）` : ""}`,
-        failed ? "err" : "ok"
-      );
+      const { uploaded, failed, total } = job;
+      if (!job.cancelled) {
+        toast(
+          `素材已上传 ${uploaded}/${total} 个到 ComfyUI input${failed ? `，${failed} 个失败（文件不在本次会话）` : ""}`,
+          failed ? "err" : "ok"
+        );
+      }
     }
   }
 
