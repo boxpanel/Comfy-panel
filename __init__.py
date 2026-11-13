@@ -30,7 +30,7 @@ from server import PromptServer
 WEB_DIRECTORY = "./web"
 
 # 版本号：与 pyproject.toml 的 [project] version 保持一致，发版时一起改
-__version__ = "0.53.3"
+__version__ = "0.53.4"
 
 PLUGIN_DIR = Path(__file__).parent
 

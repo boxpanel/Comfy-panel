@@ -63,11 +63,11 @@ import {
   writePlanPromptPrefix,
   writeRuleBridgeText,
   writeH3Shot,
-} from "./storyboard_bridge.js?v=20261113b";
+} from "./storyboard_bridge.js?v=20261113c";
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 2;
-const PANEL_VERSION = `v53.3 · 跨镜接续 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.4 · 自动诊断 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -356,6 +356,8 @@ function loadState() {
     shots: saved.shots && typeof saved.shots === "object" ? saved.shots : {},
     // 本镜手动从上一镜末帧取的图（key 是单元编号）
     continuity: saved.continuity && typeof saved.continuity === "object" ? saved.continuity : {},
+    // 自动模式最后一条状态（停在哪、为什么停）
+    autoNote: typeof saved.autoNote === "string" ? saved.autoNote : "",
     draftBase:
       saved.draftBase && typeof saved.draftBase === "object" && saved.draftBase.width && saved.draftBase.height
         ? saved.draftBase
@@ -679,6 +681,7 @@ export function createStoryboardPanel(root, app) {
           tags: state.tags,
           shots: state.shots,
           continuity: state.continuity,
+          autoNote: state.autoNote || "",
           draftBase: state.draftBase,
         })
       );
@@ -3093,6 +3096,9 @@ export function createStoryboardPanel(root, app) {
   const AUTO_HINT = "开启后自动：应用 → 排队 → 等生成完成 → 下一镜";
 
   function setAutoStatus(text) {
+    // 状态写进 state：切页签重建面板后还能看到自动模式停在哪、为什么停
+    state.autoNote = text || "";
+    persist();
     if (!el["auto-text"]) return;
     el["auto-text"].textContent = text || AUTO_HINT;
   }
@@ -3132,6 +3138,26 @@ export function createStoryboardPanel(root, app) {
     }
   }
 
+  /** 从 /history 的 status.messages 里提取具体失败原因（节点、异常） */
+  function describeFailure(entry) {
+    const messages = (entry && entry.status && entry.status.messages) || [];
+    for (const item of messages) {
+      if (!Array.isArray(item)) continue;
+      const kind = item[0];
+      const data = item[1] || {};
+      if (kind === "execution_error") {
+        const node = data.node_id != null ? `节点 #${data.node_id} ` : "";
+        const type = data.node_type ? `${data.node_type}：` : "";
+        const text = String(data.exception_message || data.exception_type || "")
+          .split("\n")[0]
+          .slice(0, 160);
+        return `${node}${type}${text || "执行出错"}`;
+      }
+      if (kind === "execution_interrupted") return "执行被中断（有人点了取消，或服务器重启）";
+    }
+    return "生成失败，详情看 ComfyUI 控制台";
+  }
+
   /** 等这一条任务在 /history 里出现完成状态 */
   async function waitForPrompt(promptId) {
     const started = Date.now();
@@ -3146,8 +3172,8 @@ export function createStoryboardPanel(root, app) {
             const failed = entry.status.status_str && entry.status.status_str !== "success";
             return {
               ok: !failed,
-              message: failed ? "生成失败，详情看 ComfyUI 控制台" : "",
-              videos: collectOutputVideos(entry),
+              message: failed ? describeFailure(entry) : "",
+              videos: failed ? [] : collectOutputVideos(entry),
             };
           }
         }
@@ -3181,8 +3207,15 @@ export function createStoryboardPanel(root, app) {
       while (!autoStopRequested) {
         const unit = nextAutoUnit();
         if (!unit) {
-          setAutoStatus(`全部完成：共 ${done} 镜`);
-          toast(`自动模式完成：共生成 ${done} 镜`, "ok");
+          // 之前跑过的镜会留在「已做」里，自动模式不会重跑：把数字说清楚
+          const total = state.doc.units.length;
+          const skipped = Math.max(0, total - done);
+          setAutoStatus(
+            `全部完成：本次跑了 ${done} 镜${
+              skipped ? `，另有 ${skipped} 镜之前已标记完成（要重跑请重新导入文档）` : ""
+            }`
+          );
+          toast(`自动模式完成：本次生成 ${done} 镜`, "ok");
           break;
         }
         setAutoStatus(`第 ${done + 1} 镜：${unit.id} 写入中…`);
@@ -3191,6 +3224,7 @@ export function createStoryboardPanel(root, app) {
           setCardMessage(unit, result.detail, "err");
           setAutoStatus(`停在 ${unit.id}：${result.detail}`);
           toast(`${unit.id} 写入失败，自动模式已停止`, "err");
+          console.error(`[分镜面板] ${unit.id} 写入失败：${result.detail}`);
           break;
         }
         setCardMessage(unit, result.detail, "ok");
@@ -3203,6 +3237,7 @@ export function createStoryboardPanel(root, app) {
           if (autoStopRequested) break;
           setAutoStatus(`排队失败：${queued.message}`);
           toast(`排队失败：${queued.message}`, "err");
+          console.error(`[分镜面板] ${unit.id} 排队失败：${queued.message}`);
           break;
         }
         const finished = await waitForPrompt(queued.promptId);
@@ -3210,6 +3245,7 @@ export function createStoryboardPanel(root, app) {
           if (!autoStopRequested) {
             setAutoStatus(`${unit.id} 生成失败：${finished.message}`);
             toast(`${unit.id} 生成失败，自动模式已停止`, "err");
+            console.error(`[分镜面板] ${unit.id} 生成失败：${finished.message}`);
           }
           break;
         }
@@ -3225,9 +3261,18 @@ export function createStoryboardPanel(root, app) {
         advancePlanAfterApply();
         setCardMessage(unit, `${result.detail}；已生成`, "ok");
         done += 1;
+        console.info(
+          `[分镜面板] ${unit.id} 完成（本次第 ${done} 镜），输出视频 ${finished.videos ? finished.videos.length : 0} 个`
+        );
         setAutoStatus(`已完成 ${done} 镜，准备下一镜…`);
         await sleep(800);
       }
+    } catch (error) {
+      // 任何没兜住的异常都要说出来，不能悄悄停
+      const reason = error && error.message ? error.message : String(error);
+      console.error("[分镜面板] 自动模式异常", error);
+      setAutoStatus(`自动模式异常停止：${reason}`);
+      toast(`自动模式异常停止：${reason}`, "err");
     } finally {
       autoRunning = false;
       applying = false;
@@ -3804,6 +3849,8 @@ export function createStoryboardPanel(root, app) {
   renderAll();
   refreshReady();
   loadImageFiles();
+  // 上次自动模式停在哪：重建面板后继续显示，方便查原因
+  if (state.autoNote) setAutoStatus(state.autoNote);
 
   return {
     refresh() {

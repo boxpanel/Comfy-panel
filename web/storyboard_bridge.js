@@ -5,7 +5,7 @@
 const TEXT_WIDGETS = ["text", "prompt", "string"];
 
 /** 桥接模块构建号：面板徽标里一起显示，用来确认浏览器加载的是新代码 */
-export const BRIDGE_BUILD = "20261113b";
+export const BRIDGE_BUILD = "20261113c";
 
 /** 只返回真正参与执行的工作流节点（排除静音 mode 2 与旁路 mode 4） */
 export function getNodes(app) {
@@ -1293,11 +1293,11 @@ export function setNodeVideo(app, node, filename) {
   } catch (error) {
     /* 某些前端 callback 参数不一致，忽略 */
   }
-  // H3 参考视频要求 24fps；上限 15 秒（360 帧），再长 H3 也会按生成长度截断
+  // H3 参考视频要求 24fps；只取前 5 秒（120 帧），够锁定人物/服装/环境，又不会把显存吃满
   const rate = getWidget(node, "force_rate");
   if (rate) rate.value = 24;
   const cap = getWidget(node, "frame_load_cap");
-  if (cap) cap.value = 360;
+  if (cap) cap.value = 120;
   const skip = getWidget(node, "skip_first_frames");
   if (skip) skip.value = 0;
   markDirty(app, node);
