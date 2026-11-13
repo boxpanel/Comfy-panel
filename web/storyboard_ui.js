@@ -11,7 +11,7 @@ import {
   parseFrameName,
   parseStoryboard,
   summarize,
-} from "./storyboard_parser.js?v=20261113e";
+} from "./storyboard_parser.js?v=20261113f";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -63,11 +63,11 @@ import {
   writePlanPromptPrefix,
   writeRuleBridgeText,
   writeH3Shot,
-} from "./storyboard_bridge.js?v=20261113e";
+} from "./storyboard_bridge.js?v=20261113f";
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 2;
-const PANEL_VERSION = `v53.6 · 换入口 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.7 · 接续开关 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -87,6 +87,8 @@ const DEFAULT_SETTINGS = {
   cutout: false,
   cutoutBg: "#000000",
   dropCnSound: false,
+  // 跨镜接续：把上一镜输出视频接到参考视频1（<Video 1>）
+  continuityVideo: true,
   referenceRule: "",
   nodeIds: { positive: "", negative: "", sampler: "", latent: "", image: "" },
 };
@@ -608,6 +610,10 @@ export function createStoryboardPanel(root, app) {
       <div class="sb-frame">
         <label class="sb-chk"><input type="checkbox" data-el="auto"> 全自动（低画质）</label>
         <span class="sb-hint grow" data-el="auto-text">开启后自动：应用 → 排队 → 等生成完成 → 下一镜</span>
+      </div>
+      <div class="sb-frame">
+        <label class="sb-chk"><input type="checkbox" data-el="contvideo" title="把上一镜生成的视频接到「参考视频1」，保持人物、服装、环境连续"> 接上一镜视频</label>
+        <span class="sb-hint grow">跨镜接续用；如果某镜因此生成失败，可以先关掉再跑</span>
       </div>
       <div class="sb-progress">
         <div class="track"><div class="bar" data-el="progress-bar"></div></div>
@@ -1883,18 +1889,46 @@ export function createStoryboardPanel(root, app) {
     return shot.type && shot.type !== "input" ? `[${shot.type}]${path}` : path;
   }
 
+  /** 上一镜视频是否真的能从 /view 读到：读不到就别接，免得整镜排队失败 */
+  async function videoReachable(shot) {
+    if (!shot || !shot.filename) return false;
+    try {
+      const query = new URLSearchParams({
+        filename: shot.filename,
+        subfolder: shot.subfolder || "",
+        type: shot.type || "output",
+      });
+      const url = typeof api.apiURL === "function" ? api.apiURL(`/view?${query.toString()}`) : `/view?${query}`;
+      const response = await fetch(url, { method: "HEAD", cache: "no-store" });
+      return response.ok;
+    } catch (error) {
+      return false;
+    }
+  }
+
   /**
    * 跨镜衔接：把上一镜生成出来的视频接到 ref_videos.ref_video_0（提示词里的 <Video 1>）。
    * 只有同一场才接；没有上一镜输出时把面板写过的视频位关掉，避免串片。
    */
-  function applyUnitVideo(unit) {
+  async function applyUnitVideo(unit) {
     lastVideoBound = null;
     if (!referenceVideoSlots(app).length) return { ok: true, message: "" };
+    if (settings().continuityVideo === false) {
+      const cleared = clearVideoSlotsFrom(app, 0);
+      return { ok: true, message: cleared ? "已关闭跨镜接续，清空参考视频" : "" };
+    }
     const prev = previousUnit(unit);
     const shot = prev ? state.shots[prev.id] : null;
     if (!prev || !shot || !shot.filename) {
       const cleared = clearVideoSlotsFrom(app, 0);
       return { ok: true, message: cleared ? `已断开上一镜的参考视频（${cleared} 路）` : "" };
+    }
+    if (!(await videoReachable(shot))) {
+      const cleared = clearVideoSlotsFrom(app, 0);
+      return {
+        ok: true,
+        message: `上一镜视频读不到（${shot.filename}），已跳过接续${cleared ? "并清空视频位" : ""}`,
+      };
     }
     const result = ensureReferenceVideo(app, 0, annotatedVideoName(shot));
     if (!result.ok) return { ok: true, message: `参考视频没接上：${result.message}` };
@@ -2142,7 +2176,7 @@ export function createStoryboardPanel(root, app) {
 
   /** 按工作流的素材入口选择：先写首尾帧，再按 Ref2V 参考位或首帧处理素材 */
   async function applyVisualToUnit(unit) {
-    const video = applyUnitVideo(unit);
+    const video = await applyUnitVideo(unit);
     const frames = await applyUnitFrames(unit);
     const audio = await applyUnitAudio(unit);
     const slots = referenceImageSlots(app);
@@ -3423,6 +3457,13 @@ export function createStoryboardPanel(root, app) {
   });
 
   // 设置项
+  el.contvideo.checked = settings().continuityVideo !== false;
+  el.contvideo.addEventListener("change", () => {
+    settings().continuityVideo = el.contvideo.checked;
+    persist();
+    toast(el.contvideo.checked ? "跨镜接续：开启" : "跨镜接续：关闭（不再接上一镜视频）", "ok");
+  });
+
   el.mode.value = settings().mode;
   el.mode.addEventListener("change", () => {
     settings().mode = el.mode.value;
