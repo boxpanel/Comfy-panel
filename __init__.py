@@ -30,7 +30,7 @@ from server import PromptServer
 WEB_DIRECTORY = "./web"
 
 # 版本号：与 pyproject.toml 的 [project] version 保持一致，发版时一起改
-__version__ = "0.53.4"
+__version__ = "0.53.5"
 
 PLUGIN_DIR = Path(__file__).parent
 
@@ -277,6 +277,34 @@ async def storyboard_update_status(request):
 @PromptServer.instance.routes.post("/storyboard/update/apply")
 async def storyboard_update_apply(request):
     return web.json_response(await asyncio.to_thread(_update_apply))
+
+
+def _install_no_cache_middleware():
+    """面板前端文件禁止浏览器/反向代理长期缓存。
+
+    ComfyUI 的 /extensions 静态路由没有 Cache-Control，浏览器会按
+    Last-Modified 做启发式缓存，结果插件更新后页面仍加载旧面板。
+    """
+
+    @web.middleware
+    async def storyboard_no_cache(request, handler):
+        response = await handler(request)
+        if request.path.startswith("/extensions/ComfyUI-StoryboardPanel/"):
+            headers = getattr(response, "headers", None)
+            if headers is not None:
+                headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+                headers["Pragma"] = "no-cache"
+        return response
+
+    try:
+        app = getattr(PromptServer.instance, "app", None)
+        if app is not None and hasattr(app, "middlewares"):
+            app.middlewares.append(storyboard_no_cache)
+    except Exception as error:  # noqa: BLE001 - 缓存头失败不影响面板
+        LOGGER.warning("[分镜面板] 无法安装静态缓存头：%s", error)
+
+
+_install_no_cache_middleware()
 
 
 __all__ = ["WEB_DIRECTORY", "NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "__version__"]
