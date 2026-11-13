@@ -30,7 +30,7 @@ from server import PromptServer
 WEB_DIRECTORY = "./web"
 
 # 版本号：与 pyproject.toml 的 [project] version 保持一致，发版时一起改
-__version__ = "0.53.9"
+__version__ = "0.53.10"
 
 PLUGIN_DIR = Path(__file__).parent
 
@@ -235,8 +235,25 @@ def _update_status():
         head = _git(["rev-parse", "--short", "HEAD"]).stdout.strip()
         counts = _git(["rev-list", "--left-right", "--count", "HEAD...@{u}"]).stdout.split()
         ahead, behind = (int(counts[0]), int(counts[1])) if len(counts) == 2 else (0, 0)
-        dirty = bool(_git(["status", "--porcelain"]).stdout.strip())
-        return {"ok": True, "git": True, "head": head, "ahead": ahead, "behind": behind, "dirty": dirty}
+        # 只有「被改过的已跟踪文件」才阻止更新；残留的旧 js、__pycache__ 不算
+        dirty_out = _git(["status", "--porcelain", "--untracked-files=no"]).stdout.strip()
+        dirty_files = [line[3:].strip() for line in dirty_out.splitlines() if line.strip()]
+        untracked_out = _git(["status", "--porcelain", "--untracked-files=normal"]).stdout
+        untracked = [
+            line[3:].strip()
+            for line in untracked_out.splitlines()
+            if line.startswith("?? ") and line.strip()
+        ]
+        return {
+            "ok": True,
+            "git": True,
+            "head": head,
+            "ahead": ahead,
+            "behind": behind,
+            "dirty": bool(dirty_files),
+            "dirtyFiles": dirty_files,
+            "untracked": untracked,
+        }
     except FileNotFoundError:
         return {"ok": False, "git": False, "message": "服务器没有安装 git"}
     except subprocess.TimeoutExpired:
@@ -245,27 +262,66 @@ def _update_status():
         return {"ok": False, "git": True, "message": str(error)[:300]}
 
 
+def _tracked_web_names():
+    out = _git(["ls-files", "web"]).stdout
+    return {Path(line.strip()).name for line in out.splitlines() if line.strip()}
+
+
+def _drop_stale_web_js():
+    """删掉 web 下不在 git 里的旧入口。
+
+    入口文件升级时会改名（storyboard_panel_v539.js → v540），旧文件如果
+    没被 git 跟踪就会一直留着，两个入口同时加载会让面板注册两次。
+    """
+    web_dir = PLUGIN_DIR / "web"
+    if not web_dir.is_dir():
+        return []
+    tracked = _tracked_web_names()
+    removed = []
+    for item in web_dir.glob("storyboard_panel*.js"):
+        if item.name in tracked:
+            continue
+        try:
+            item.unlink()
+            removed.append(item.name)
+        except Exception:  # noqa: BLE001 - 删不掉就留着，不影响本次更新
+            pass
+    return removed
+
+
 def _update_apply():
     status = _update_status()
     if not status.get("ok"):
         return {"ok": False, "message": status.get("message", "无法检查更新")}
     if status.get("dirty"):
-        return {"ok": False, "message": "插件目录有本地修改，先还原或提交后再更新"}
+        files = "、".join(status.get("dirtyFiles", [])[:5]) or "工作区文件"
+        return {
+            "ok": False,
+            "message": f"这些文件被改过：{files}。在插件目录执行 git checkout -- . 后再更新",
+        }
     if not status.get("behind"):
-        return {"ok": True, "changed": [], "message": f"已是最新版本（{status.get('head')}）"}
+        removed = _drop_stale_web_js()
+        return {
+            "ok": True,
+            "changed": [],
+            "removed": removed,
+            "message": f"已是最新版本（{status.get('head')}）" + (f"，已清理旧入口 {len(removed)} 个" if removed else ""),
+        }
     before = _git(["rev-parse", "HEAD"]).stdout.strip()
     pull = _git(["pull", "--ff-only"])
     if pull.returncode != 0:
         return {"ok": False, "message": (pull.stderr or pull.stdout or "git pull 失败").strip()[:300]}
     after = _git(["rev-parse", "HEAD"]).stdout.strip()
     changed = [line.strip() for line in _git(["diff", "--name-only", before, after]).stdout.splitlines() if line.strip()]
+    removed = _drop_stale_web_js()
     return {
         "ok": True,
         "before": before[:7],
         "after": after[:7],
         "changed": changed,
+        "removed": removed,
         "restart": "__init__.py" in changed,
-        "message": f"已更新 {before[:7]} → {after[:7]}",
+        "message": f"已更新 {before[:7]} → {after[:7]}" + (f"，清理旧入口 {len(removed)} 个" if removed else ""),
     }
 
 
