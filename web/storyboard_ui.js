@@ -64,7 +64,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 2;
-const PANEL_VERSION = `v53 · 上传进度 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.1 · 上传进度 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -2014,7 +2014,9 @@ export function createStoryboardPanel(root, app) {
     const text = wrap.querySelector('[data-el="upload-text"]');
     if (text) {
       const failed = librarySync && librarySync.failed ? librarySync.failed : 0;
-      text.textContent = `已上传 ${uploaded} / ${total} 个${failed ? ` · 失败 ${failed}` : ""}`;
+      const running = librarySync && librarySync.running;
+      // 服务器上传慢，成功数可能长时间是 0，所以把已处理数一起显示，让用户看到进度在动
+      text.textContent = `已上传 ${uploaded} / ${total} 个${running ? ` · 处理中 ${done}/${total}` : ""}${failed ? ` · 失败 ${failed}` : ""}`;
     }
     const fill = wrap.querySelector('[data-el="upload-fill"]');
     if (fill) fill.style.width = `${percent}%`;
@@ -2063,10 +2065,9 @@ export function createStoryboardPanel(root, app) {
           else job.failed += 1;
         }
         job.done += 1;
-        if (job.done % 3 === 0 || job.done === job.total) {
-          saveLibraryStore();
-          libraryListener();
-        }
+        // 服务器上传慢时进度条要一点点走，所以每个文件完成都刷新一次
+        saveLibraryStore();
+        libraryListener();
       }
     };
     try {
