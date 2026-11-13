@@ -5,7 +5,7 @@
 const TEXT_WIDGETS = ["text", "prompt", "string"];
 
 /** 桥接模块构建号：面板徽标里一起显示，用来确认浏览器加载的是新代码 */
-export const BRIDGE_BUILD = "20261113c";
+export const BRIDGE_BUILD = "20261113e";
 
 /** 只返回真正参与执行的工作流节点（排除静音 mode 2 与旁路 mode 4） */
 export function getNodes(app) {
@@ -1343,6 +1343,75 @@ export function clearVideoSlotsFrom(app, keep) {
     cleared += 1;
   }
   return cleared;
+}
+
+const FIGHT_LORA_RULES = [
+  { key: "combat", label: "Combat", re: /h3[_\-\s]?combat/i },
+  { key: "fight", label: "Fight Flow", re: /fight[_\-\s]?flow/i },
+  { key: "motion", label: "Motion Repair", re: /motion[_\-\s]?repair/i },
+  { key: "speed", label: "Speed", re: /motion[_\-\s]?speed/i },
+];
+
+/** 工作流里的武打 LoRA：按 LoRA 文件名认（Combat / Fight Flow / Motion Repair） */
+export function findFightLoras(app) {
+  const found = [];
+  for (const node of getAllNodes(app)) {
+    if (!/LoraLoader/i.test(String(node.type || ""))) continue;
+    const widget = getWidget(node, "lora_name") || getWidget(node, "lora");
+    if (!widget) continue;
+    const name = String(widget.value || "");
+    const rule = FIGHT_LORA_RULES.find((item) => item.re.test(name));
+    if (rule) found.push({ node, rule, name });
+  }
+  return found;
+}
+
+/** 速度滑块：motion_speed LoRA 的 strength_model 上游，兜底按标题找「速度滑块」 */
+export function findSpeedSlider(app) {
+  for (const node of getAllNodes(app)) {
+    if (!/LoraLoader/i.test(String(node.type || ""))) continue;
+    const widget = getWidget(node, "lora_name");
+    if (!widget || !/motion[_\-\s]?speed/i.test(String(widget.value || ""))) continue;
+    const input = (node.inputs || []).find((item) => item && item.name === "strength_model");
+    if (!input || input.link === undefined || input.link === null) continue;
+    const link = getLink(app, input.link);
+    const source = link ? getNodeById(app, link.origin_id) : null;
+    if (source) return source;
+  }
+  return getAllNodes(app).find((node) => /速度滑块/.test(String(node.title || ""))) || null;
+}
+
+/**
+ * 按镜头开关武打 LoRA。
+ * enabled=true：启用 Combat / Fight Flow / Motion Repair，并把速度滑块写成 speed；
+ * enabled=false：这三个 LoRA 全部旁路（速度滑块不动）。
+ */
+export function setFightLoras(app, enabled, speed) {
+  const loras = findFightLoras(app);
+  for (const item of loras) {
+    item.node.mode = enabled ? 0 : 4;
+    markDirty(app, item.node);
+  }
+  let speedValue = null;
+  if (enabled && Number.isFinite(Number(speed))) {
+    const slider = findSpeedSlider(app);
+    const widget = slider
+      ? getWidget(slider, "值") || (Array.isArray(slider.widgets) ? slider.widgets[0] : null)
+      : null;
+    if (widget) {
+      widget.value = Number(speed);
+      try {
+        if (typeof widget.callback === "function") {
+          widget.callback(widget.value, undefined, slider, [0, 0], null);
+        }
+      } catch (error) {
+        /* 自定义滑条 callback 参数不一致，忽略 */
+      }
+      speedValue = widget.value;
+      markDirty(app, slider);
+    }
+  }
+  return { ok: loras.length > 0, loras: loras.map((item) => item.rule.label), speed: speedValue };
 }
 
 /** 清空一个参考位：断开连线、清空窗口里的图片，窗口本身保留（方便下次复用） */

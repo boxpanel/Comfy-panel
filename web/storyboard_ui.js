@@ -52,6 +52,7 @@ import {
   referenceVideoSlots,
   removeReferenceNodes,
   routeReferenceSlotsThroughBridge,
+  setFightLoras,
   setNodeImage,
   setPlanResolution,
   setPromptText,
@@ -63,11 +64,11 @@ import {
   writePlanPromptPrefix,
   writeRuleBridgeText,
   writeH3Shot,
-} from "./storyboard_bridge.js?v=20261113f";
+} from "./storyboard_bridge.js?v=20261113e";
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 2;
-const PANEL_VERSION = `v53.10 · 更新修复 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.11 · 武打自动 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -89,6 +90,8 @@ const DEFAULT_SETTINGS = {
   dropCnSound: false,
   // 跨镜接续：把上一镜输出视频接到参考视频1（<Video 1>）
   continuityVideo: true,
+  // 按分镜文字自动开关武打 LoRA（Combat / Fight Flow / Motion Repair）
+  fightAuto: true,
   referenceRule: "",
   nodeIds: { positive: "", negative: "", sampler: "", latent: "", image: "" },
 };
@@ -243,6 +246,12 @@ const CSS = `
 .sb-tier.C{background:#b8860b;}
 .sb-card-meta{color:var(--sb-muted);font-size:10.5px;display:flex;gap:5px;flex-wrap:wrap;}
 .sb-check{margin-left:auto;color:#3fb950;font-weight:700;font-size:11px;}
+.sb-fight{
+  font-size:9.5px;padding:1px 5px;border-radius:9px;white-space:nowrap;cursor:pointer;
+  border:1px solid var(--sb-line);color:var(--sb-muted);background:transparent;user-select:none;
+}
+.sb-fight.on{border-color:#f97316;color:#fb923c;background:rgba(249,115,22,.14);font-weight:600;}
+.sb-fight:hover{border-color:var(--sb-accent);}
 .sb-zh{font-size:11.5px;line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
 .sb-en{font-size:10.5px;line-height:1.45;color:var(--sb-muted);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;}
 .sb-zh.open,.sb-en.open{display:block;-webkit-line-clamp:unset;}
@@ -319,6 +328,47 @@ function injectStyle() {
   document.head.appendChild(style);
 }
 
+// 武打镜头判定：命中 1 个打斗动作词，或 3 种「抓按推撞」类肢体接触词
+const FIGHT_VIOLENT_RE =
+  /拳|踢|踹|搏斗|格斗|打斗|扭打|厮打|扑倒|扑上来|扑住|按倒|被打|打倒|推倒|摔倒|压倒|掐|拖拽|抢夺|抢过|抢走|抢袋|夺下|耳光|殴打|击打|揍|锁喉|杖击|棍击/g;
+const FIGHT_CONTACT_RE = /抓|按|推|撞|挥|拉|扯/g;
+const FIGHT_EN_RE = /\b(punch|kick|grapple|wrestle|tackle|combat|melee|brawl|scuffle)\b/gi;
+// 「抱拳」「拳头大的石头」「抢话」「不抢到他前面」不是打斗
+const FIGHT_NOISE_RE = /抱拳|拳头大|抢话|抢到|抢先|抢救|抢修/g;
+// 只看 主体/画面/动作 三段：运镜「推」、光「打在」会污染判断
+const FIGHT_SECTION_RES = [
+  /主体[：:]([\s\S]*?)(?=画面[：:]|光[：:]|镜头[：:]|构图[：:]|运镜[：:]|动作[：:]|时间[：:]|$)/,
+  /画面[：:]([\s\S]*?)(?=光[：:]|镜头[：:]|构图[：:]|运镜[：:]|动作[：:]|时间[：:]|$)/,
+  /动作[：:]([\s\S]*?)(?=时间[：:]|$)/,
+];
+
+function unitFightText(unit) {
+  const zh = String(unit.promptZh || "");
+  const parts = FIGHT_SECTION_RES.map((re) => (zh.match(re) || [])[1] || "");
+  const body = parts.join(" ").trim() || zh;
+  return `${body} ${unit.promptEn || ""} ${unit.continuity || ""} ${unit.retention || ""}`.replace(
+    FIGHT_NOISE_RE,
+    " "
+  );
+}
+
+/** 从分镜文字判断这一镜是不是打斗，命中就自动开武打 LoRA */
+function looksLikeFight(unit) {
+  const text = unitFightText(unit);
+  const violent = (text.match(FIGHT_VIOLENT_RE) || []).length + (text.match(FIGHT_EN_RE) || []).length;
+  const contact = new Set(text.match(FIGHT_CONTACT_RE) || []).size;
+  return violent >= 1 || contact >= 3;
+}
+
+/** 武打速度滑块（-10 ~ +10）：按档位的动作幅度映射（未写入参数时回落到档位默认值） */
+function fightSpeedFor(unit) {
+  const params = unit.params || cloneTierDefaults()[unit.tier] || cloneTierDefaults().B;
+  const motion = String((params && params.motion) || "");
+  if (motion.includes("高")) return 6;
+  if (motion.includes("低")) return 1;
+  return 3;
+}
+
 /** 从 /history 的结果里收集输出视频（VHS_VideoCombine 把 mp4 放在 gifs 里） */
 function collectOutputVideos(entry) {
   const found = [];
@@ -360,6 +410,8 @@ function loadState() {
     continuity: saved.continuity && typeof saved.continuity === "object" ? saved.continuity : {},
     // 自动模式最后一条状态（停在哪、为什么停）
     autoNote: typeof saved.autoNote === "string" ? saved.autoNote : "",
+    // 每镜的武打开关（用户手动覆盖自动判断，true/false）
+    fight: saved.fight && typeof saved.fight === "object" ? saved.fight : {},
     draftBase:
       saved.draftBase && typeof saved.draftBase === "object" && saved.draftBase.width && saved.draftBase.height
         ? saved.draftBase
@@ -615,6 +667,10 @@ export function createStoryboardPanel(root, app) {
         <label class="sb-chk"><input type="checkbox" data-el="contvideo" title="把上一镜生成的视频接到「参考视频1」，保持人物、服装、环境连续"> 接上一镜视频</label>
         <span class="sb-hint grow">跨镜接续用；如果某镜因此生成失败，可以先关掉再跑</span>
       </div>
+      <div class="sb-frame">
+        <label class="sb-chk"><input type="checkbox" data-el="fightauto" title="按分镜文字判断本镜是否武打，自动开关武打 LoRA 与速度滑块"> 武打自动</label>
+        <span class="sb-hint grow">武打镜开 LoRA，其余旁路；卡片上的「武打」徽标可手动改</span>
+      </div>
       <div class="sb-progress">
         <div class="track"><div class="bar" data-el="progress-bar"></div></div>
         <span data-el="progress-text">0 / 0</span>
@@ -688,6 +744,7 @@ export function createStoryboardPanel(root, app) {
           shots: state.shots,
           continuity: state.continuity,
           autoNote: state.autoNote || "",
+          fight: state.fight,
           draftBase: state.draftBase,
         })
       );
@@ -1971,6 +2028,27 @@ export function createStoryboardPanel(root, app) {
     return { ok: true, message: `参考视频 ← ${prev.id}` };
   }
 
+  /** 本镜是否武打：用户手动覆盖优先，否则按分镜文字自动判断 */
+  function unitFight(unit) {
+    if (typeof state.fight[unit.id] === "boolean") {
+      return { on: state.fight[unit.id], manual: true };
+    }
+    return { on: looksLikeFight(unit), manual: false };
+  }
+
+  /** 按本镜类型开关武打 LoRA 与速度滑块（工作流没有这些 LoRA 时静默跳过） */
+  function applyUnitFight(unit) {
+    if (settings().fightAuto === false && typeof state.fight[unit.id] !== "boolean") {
+      return { ok: true, message: "" };
+    }
+    const fight = unitFight(unit);
+    const result = setFightLoras(app, fight.on, fightSpeedFor(unit));
+    if (!result.ok) return { ok: true, message: "" };
+    if (!fight.on) return { ok: true, message: "武打 LoRA 已旁路" };
+    const speed = result.speed != null ? `，速度 ${result.speed}` : "";
+    return { ok: true, message: `武打 LoRA 开启（${result.loras.join(" / ")}${speed}）` };
+  }
+
   // ---------- 取上一镜末帧：可拖框裁出局部（跨景别时当局部参考） ----------
 
   let sampler = null; // { unit, prev, image, rect, wrap }
@@ -2592,6 +2670,7 @@ export function createStoryboardPanel(root, app) {
     const prevUnit = previousUnit(unit);
     const prevShot = prevUnit ? state.shots[prevUnit.id] : null;
     const cont = state.continuity[unit.id];
+    const fight = unitFight(unit);
     const contLine = cont
       ? `<div class="sb-line"><b>衔接帧</b> ${escapeHtml(cont.name)}${cont.cropped ? "（局部）" : ""}${
           cont.from ? ` ← ${escapeHtml(cont.from)} 末帧` : ""
@@ -2613,6 +2692,9 @@ export function createStoryboardPanel(root, app) {
             ${unit.shot ? `<span>· ${escapeHtml(unit.shot)}</span>` : ""}
             ${unit.camera ? `<span>· ${escapeHtml(unit.camera)}</span>` : ""}
           </span>
+          <span class="sb-fight ${fight.on ? "on" : ""}" data-act="fight" title="武打 LoRA：${
+            fight.on ? "开" : "关"
+          }（${fight.manual ? "手动" : "按分镜自动"}），点击切换">武打${fight.manual ? "·手动" : ""}</span>
           <span class="sb-check">${applied ? "✓" : ""}</span>
         </div>
         <div class="sb-zh ${expanded ? "open" : ""}">${escapeHtml(unit.promptZh || "（无中文提示词）")}</div>
@@ -3125,8 +3207,9 @@ export function createStoryboardPanel(root, app) {
     const image = await applyVisualToUnit(unit);
     const prompt = applyPromptToUnit(unit);
     const params = applyParamsToUnit(unit, options);
+    const fight = applyUnitFight(unit);
     const ok = prompt.ok && params.ok && image.ok;
-    const detail = [image.message, prompt.message, params.message].filter(Boolean).join("；");
+    const detail = [image.message, prompt.message, params.message, fight.message].filter(Boolean).join("；");
     return { ok, detail };
   }
 
@@ -3427,6 +3510,7 @@ export function createStoryboardPanel(root, app) {
     // 新一批：上一批的输出视频与衔接帧不再适用，留着会接错片
     state.shots = {};
     state.continuity = {};
+    state.fight = {};
     state.autoNote = "";
     // 新分镜：旧的首帧选择和自定义标签都属于上一批素材，清掉避免串用
     const docCodes = new Set();
@@ -3516,6 +3600,13 @@ export function createStoryboardPanel(root, app) {
     settings().continuityVideo = el.contvideo.checked;
     persist();
     toast(el.contvideo.checked ? "跨镜接续：开启" : "跨镜接续：关闭（不再接上一镜视频）", "ok");
+  });
+
+  el.fightauto.checked = settings().fightAuto !== false;
+  el.fightauto.addEventListener("change", () => {
+    settings().fightAuto = el.fightauto.checked;
+    persist();
+    toast(el.fightauto.checked ? "武打 LoRA：按分镜自动开关" : "武打 LoRA：不再自动开关，只认卡片手动设置", "ok");
   });
 
   el.mode.value = settings().mode;
@@ -3855,6 +3946,13 @@ export function createStoryboardPanel(root, app) {
       return;
     }
 
+    if (act === "fight") {
+      state.fight[unit.id] = !unitFight(unit).on;
+      persist();
+      renderList();
+      return;
+    }
+
     if (act === "copy") {
       // H3 计划：复制真正会写入的英文结构；普通工作流：按当前语言设置拼
       const text = planInfoSafe()
@@ -3893,13 +3991,14 @@ export function createStoryboardPanel(root, app) {
 
     if (act === "all") {
       try {
+        const fight = applyUnitFight(unit);
         const prompt = applyPromptToUnit(unit);
         const params = applyParamsToUnit(unit);
         const image = await applyVisualToUnit(unit);
         const ok = prompt.ok && params.ok && image.ok;
         markApplied(unit, ok);
         if (ok) advancePlanAfterApply();
-        const message = [prompt.message, params.message, image.message].filter(Boolean).join("；");
+        const message = [image.message, prompt.message, params.message, fight.message].filter(Boolean).join("；");
         setCardMessage(unit, ok ? `${message}。回 ComfyUI 点「运行」即可` : message, ok ? "ok" : "err");
         toast(ok ? `${unit.id} 已写入，回 ComfyUI 点「运行」` : `${unit.id}：${message}`, ok ? "ok" : "err");
         refreshReady();
