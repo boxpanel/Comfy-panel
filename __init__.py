@@ -30,7 +30,7 @@ from server import PromptServer
 WEB_DIRECTORY = "./web"
 
 # 版本号：与 pyproject.toml 的 [project] version 保持一致，发版时一起改
-__version__ = "0.53.8"
+__version__ = "0.53.9"
 
 PLUGIN_DIR = Path(__file__).parent
 
@@ -345,12 +345,9 @@ async def storyboard_ref_video(request):
     source = _find_storyboard_video(folder, filename)
     if source is None:
         return web.json_response({"ok": False, "message": "视频文件不在服务器上（可能已被清理）"})
-    target_dir = Path(folder_paths.get_input_directory()) / "storyboard_ref"
-    try:
-        target_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as error:  # noqa: BLE001
-        return web.json_response({"ok": False, "message": f"创建参考目录失败：{error}"})
-    target = target_dir / source.name
+    # 必须放 input 根目录：VHS_LoadVideo 的 video 是下拉框，子目录不在候选列表里
+    input_dir = Path(folder_paths.get_input_directory())
+    target = input_dir / f"sb_{source.name}"
     try:
         if not target.is_file() or target.stat().st_size == 0:
             try:
@@ -359,7 +356,7 @@ async def storyboard_ref_video(request):
                 shutil.copy2(source, target)
     except Exception as error:  # noqa: BLE001
         return web.json_response({"ok": False, "message": f"转存视频失败：{error}"})
-    return web.json_response({"ok": True, "name": f"storyboard_ref/{source.name}", "source": source.name})
+    return web.json_response({"ok": True, "name": target.name, "source": source.name})
 
 
 def _install_no_cache_middleware():

@@ -67,7 +67,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 2;
-const PANEL_VERSION = `v53.8 · 视频转存 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.9 · 输入校验 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -3194,7 +3194,14 @@ export function createStoryboardPanel(root, app) {
       if (response.node_errors && Object.keys(response.node_errors).length) {
         const nodeId = Object.keys(response.node_errors)[0];
         const first = response.node_errors[nodeId];
-        const text = first && first.errors && first.errors[0] ? first.errors[0].message : "参数不合法";
+        const error = first && first.errors && first.errors[0];
+        // ComfyUI 把具体字段放在 details 里，只显示 message 会丢失「哪个输入不对」
+        const text = error
+          ? [error.message, error.details, error.extra_info && error.extra_info.input_name ? `输入 ${error.extra_info.input_name}` : ""]
+              .filter(Boolean)
+              .join("：")
+              .slice(0, 300)
+          : "参数不合法";
         return { ok: false, message: `节点 #${nodeId}：${text}` };
       }
       return { ok: true, promptId: response.prompt_id };
@@ -3302,7 +3309,7 @@ export function createStoryboardPanel(root, app) {
         if (autoStopRequested) break;
         setAutoStatus(`第 ${done + 1} 镜：${unit.id} 已排队，等待生成…`);
         let queued = await queueCurrentGraph();
-        if (!queued.ok && /Invalid video file/i.test(queued.message)) {
+        if (!queued.ok && /invalid video file|video.*not in list|not in list.*video/i.test(queued.message)) {
           // 上一镜视频在服务器上不可用：断开视频位、去掉提示词里的 <Video 1>，再排一次
           clearVideoSlotsFrom(app, 0);
           lastVideoBound = null;
