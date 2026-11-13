@@ -5,7 +5,7 @@
 const TEXT_WIDGETS = ["text", "prompt", "string"];
 
 /** 桥接模块构建号：面板徽标里一起显示，用来确认浏览器加载的是新代码 */
-export const BRIDGE_BUILD = "20261112e";
+export const BRIDGE_BUILD = "20261113b";
 
 /** 只返回真正参与执行的工作流节点（排除静音 mode 2 与旁路 mode 4） */
 export function getNodes(app) {
@@ -1057,7 +1057,7 @@ export async function clearPictureSlotsFrom(app, keepCount) {
 function clearChainSlot(app, slot) {
   const loader = slot && slot.loader;
   if (!loader) return false;
-  const widget = getWidget(loader, "image") || getWidget(loader, "audio");
+  const widget = getWidget(loader, "image") || getWidget(loader, "audio") || getWidget(loader, "video");
   const value = widget ? String(widget.value || "").trim() : "";
   const empty = !value || /^none$/i.test(value);
   // 已经清空并停用过的窗口不再重复计数，但残留的 None 也一并抹掉
@@ -1070,6 +1070,7 @@ function clearChainSlot(app, slot) {
 }
 
 const REF_AUDIO_RE = /^ref_audios\.ref_audio_(\d+)$/i;
+const REF_VIDEO_RE = /^ref_videos\.ref_video_(\d+)$/i;
 
 /** Ref2V 的参考音频位（ref_audios.ref_audio_N）；loader 是当前接着的加载音频节点 */
 export function referenceAudioSlots(app) {
@@ -1243,6 +1244,102 @@ export function clearAudioSlotsFrom(app, keep) {
       loader.mode = 4;
       markDirty(app, loader);
     }
+    cleared += 1;
+  }
+  return cleared;
+}
+
+/** 参考视频位（ref_videos.ref_video_N）：终极篇是 Ref2V ← GetNode ← SetNode ← VHS_LoadVideo */
+export function referenceVideoSlots(app) {
+  const slots = [];
+  for (const node of getNodes(app)) {
+    if (!STOCK_REF2V_TYPE.test(String(node.type || "")) || !Array.isArray(node.inputs)) continue;
+    node.inputs.forEach((input, index) => {
+      const match = REF_VIDEO_RE.exec(String((input && input.name) || ""));
+      if (!match) return;
+      const direct = followInput(app, node, input.name);
+      const chain = resolveSetGetSource(app, direct);
+      slots.push({
+        node,
+        input,
+        slot: index,
+        index: Number(match[1]),
+        direct,
+        setter: chain.setter,
+        loader: chain.source,
+      });
+    });
+  }
+  return slots.sort((a, b) => a.index - b.index);
+}
+
+/**
+ * 写加载视频节点的文件名。
+ * 值支持 ComfyUI 的 annotated 路径：上一镜输出在 output 目录，
+ * 写成 `[output]xxx.mp4` 就能被 VHS_LoadVideo 直接读到，不用复制到 input。
+ */
+export function setNodeVideo(app, node, filename) {
+  const widget = node ? getWidget(node, "video") : null;
+  if (!widget) return false;
+  const alias = String(filename || "");
+  if (widget.options && Array.isArray(widget.options.values) && !widget.options.values.includes(alias)) {
+    widget.options.values.unshift(alias);
+  }
+  widget.value = alias;
+  try {
+    if (typeof widget.callback === "function") {
+      widget.callback(alias, node.graph && node.graph.canvas ? node.graph.canvas : undefined, node, [0, 0], null);
+    }
+  } catch (error) {
+    /* 某些前端 callback 参数不一致，忽略 */
+  }
+  // H3 参考视频要求 24fps；上限 15 秒（360 帧），再长 H3 也会按生成长度截断
+  const rate = getWidget(node, "force_rate");
+  if (rate) rate.value = 24;
+  const cap = getWidget(node, "frame_load_cap");
+  if (cap) cap.value = 360;
+  const skip = getWidget(node, "skip_first_frames");
+  if (skip) skip.value = 0;
+  markDirty(app, node);
+  return true;
+}
+
+/** 把上一镜的输出视频写到 ref_videos.ref_video_N */
+export function ensureReferenceVideo(app, index, filename) {
+  const alias = String(filename || "").trim();
+  if (!alias) return { ok: false, message: "视频名为空" };
+  const slots = referenceVideoSlots(app);
+  if (!slots.length) return { ok: false, message: "当前工作流没有参考视频入口（ref_videos）" };
+  const slot = slots.find((item) => item.index === index);
+  if (!slot) return { ok: false, message: `参考视频位 ${index + 1} 没展开` };
+  const loader =
+    slot.loader && /LoadVideo/i.test(String(slot.loader.type || "")) ? slot.loader : null;
+  if (!loader) return { ok: false, message: `参考视频 ${index + 1} 没有接加载视频节点` };
+  if (!setNodeVideo(app, loader, alias)) return { ok: false, message: "加载视频节点写不进文件" };
+  loader.properties = { ...(loader.properties || {}), sbRefVideo: index + 1 };
+  loader.mode = 0;
+  markDirty(app, loader);
+  return { ok: true, loader };
+}
+
+/** 清空面板经手的参考视频位，加载视频节点停用（保留 GetNode → Ref2V 的线） */
+export function clearVideoSlotsFrom(app, keep) {
+  const count = Math.max(0, Math.trunc(Number(keep) || 0));
+  let cleared = 0;
+  for (const slot of referenceVideoSlots(app)) {
+    if (slot.index < count) continue;
+    const loader = slot.loader;
+    if (!loader || !/LoadVideo/i.test(String(loader.type || ""))) continue;
+    // 只动面板写过的，用户自己接的视频不碰
+    if (!loader.properties || loader.properties.sbRefVideo == null) continue;
+    if (slot.setter) {
+      if (clearChainSlot(app, slot)) cleared += 1;
+      continue;
+    }
+    const widget = getWidget(loader, "video");
+    if (widget) widget.value = "";
+    loader.mode = 4;
+    markDirty(app, loader);
     cleared += 1;
   }
   return cleared;

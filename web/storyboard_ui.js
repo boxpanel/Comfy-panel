@@ -20,6 +20,7 @@ import {
   clearFrameImage,
   clearPictureSlotsFrom,
   clearReferenceSlot,
+  clearVideoSlotsFrom,
   defaultReferenceTag,
   describeImageEntry,
   detectModelProfile,
@@ -28,6 +29,7 @@ import {
   ensureReferenceAudio,
   ensureReferenceImage,
   ensureReferenceSlots,
+  ensureReferenceVideo,
   ensureTaggedPicture,
   findH3PlanNode,
   findFrameInput,
@@ -47,6 +49,7 @@ import {
   readRuleBridgeText,
   referenceAudioSlots,
   referenceImageSlots,
+  referenceVideoSlots,
   removeReferenceNodes,
   routeReferenceSlotsThroughBridge,
   setNodeImage,
@@ -60,11 +63,11 @@ import {
   writePlanPromptPrefix,
   writeRuleBridgeText,
   writeH3Shot,
-} from "./storyboard_bridge.js?v=20261112e";
+} from "./storyboard_bridge.js?v=20261113b";
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 2;
-const PANEL_VERSION = `v53.2 · 音效清洗 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.3 · 跨镜接续 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -278,6 +281,13 @@ const CSS = `
 }
 .sb-toast.ok{border-color:#3fb950;}
 .sb-toast.err{border-color:#f85149;}
+.sb-modal{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.62);}
+.sb-modal-box{width:min(880px,96vw);max-height:92vh;display:flex;flex-direction:column;gap:8px;padding:10px;border-radius:8px;border:1px solid var(--sb-line);background:var(--sb-bg);color:var(--sb-fg);box-shadow:0 18px 48px rgba(0,0,0,.5);}
+.sb-modal-head{display:flex;align-items:baseline;gap:8px;}
+.sb-modal-head .sb-btn{margin-left:auto;}
+.sb-modal-canvas{display:flex;justify-content:center;background:#000;border-radius:6px;overflow:hidden;}
+.sb-modal-canvas canvas{display:block;max-width:100%;cursor:crosshair;touch-action:none;}
+.sb-modal-foot{display:flex;align-items:center;gap:6px;}
 .sb-cut{display:flex;align-items:center;gap:8px;margin-top:6px;font-size:11px;color:var(--sb-muted);}
 .sb-cut label{display:flex;align-items:center;gap:4px;cursor:pointer;}
 .sb-cut select{
@@ -307,6 +317,27 @@ function injectStyle() {
   document.head.appendChild(style);
 }
 
+/** 从 /history 的结果里收集输出视频（VHS_VideoCombine 把 mp4 放在 gifs 里） */
+function collectOutputVideos(entry) {
+  const found = [];
+  const outputs = (entry && entry.outputs) || {};
+  for (const nodeId of Object.keys(outputs)) {
+    const bucket = outputs[nodeId] || {};
+    for (const key of ["gifs", "videos", "video", "images"]) {
+      const list = bucket[key];
+      if (!Array.isArray(list)) continue;
+      for (const item of list) {
+        if (!item || !item.filename) continue;
+        if (!/\.(mp4|webm|mov|mkv)$/i.test(String(item.filename))) continue;
+        const subfolder = item.subfolder || "";
+        if (found.some((it) => it.filename === item.filename && it.subfolder === subfolder)) continue;
+        found.push({ filename: item.filename, subfolder, type: item.type || "output" });
+      }
+    }
+  }
+  return found;
+}
+
 function loadState() {
   let saved = {};
   try {
@@ -321,6 +352,10 @@ function loadState() {
     applied: saved.applied && typeof saved.applied === "object" ? saved.applied : {},
     images: saved.images && typeof saved.images === "object" ? saved.images : {},
     tags: saved.tags && typeof saved.tags === "object" ? saved.tags : {},
+    // 每镜生成出来的视频（自动模式记录），供下一镜当参考视频/抽末帧用
+    shots: saved.shots && typeof saved.shots === "object" ? saved.shots : {},
+    // 本镜手动从上一镜末帧取的图（key 是单元编号）
+    continuity: saved.continuity && typeof saved.continuity === "object" ? saved.continuity : {},
     draftBase:
       saved.draftBase && typeof saved.draftBase === "object" && saved.draftBase.width && saved.draftBase.height
         ? saved.draftBase
@@ -420,6 +455,10 @@ export function createStoryboardPanel(root, app) {
   let autoStopRequested = false;
   // 记录上一镜写进加载图像节点的首帧，下一镜没有素材时要把它清掉
   let lastAppliedImage = null;
+  // 本镜实际接上的上一镜参考视频（提示词里要写 <Video 1>）
+  let lastVideoBound = null;
+  // 最近一次应用并排队的镜，手动点「运行」后把输出视频记到它名下
+  let appliedUnitId = null;
 
   root.classList.add("sb-root");
   root.innerHTML = `
@@ -607,6 +646,26 @@ export function createStoryboardPanel(root, app) {
   // 上传可能由上一个面板实例发起：重建后把进度接回当前实例
   libraryListener = () => setLibraryStatus();
 
+  // 手动点「运行」也能记录输出视频：执行完成后记到最近应用的那一镜名下
+  if (typeof api.addEventListener === "function") {
+    api.addEventListener("execution_success", (event) => {
+      const promptId = event && event.detail && event.detail.prompt_id;
+      if (!promptId || !appliedUnitId || autoRunning) return;
+      api
+        .fetchApi(`/history/${encodeURIComponent(promptId)}`, { cache: "no-store" })
+        .then((response) => (response.ok ? response.json() : null))
+        .then((data) => {
+          const videos = collectOutputVideos(data && data[promptId]);
+          if (!videos.length) return;
+          state.shots[appliedUnitId] = { ...videos[0], at: Date.now() };
+          persist();
+          // 下一镜卡片上要出现「取上一镜末帧」
+          renderList();
+        })
+        .catch(() => {});
+    });
+  }
+
   function persist() {
     try {
       localStorage.setItem(
@@ -618,6 +677,8 @@ export function createStoryboardPanel(root, app) {
           applied: state.applied,
           images: state.images,
           tags: state.tags,
+          shots: state.shots,
+          continuity: state.continuity,
           draftBase: state.draftBase,
         })
       );
@@ -1167,6 +1228,7 @@ export function createStoryboardPanel(root, app) {
     librarySync = null;
     state.tags = {};
     state.images = {};
+    state.continuity = {};
     fileHandles.clear();
     saveLibraryStore();
     persist();
@@ -1293,7 +1355,7 @@ export function createStoryboardPanel(root, app) {
   }
 
   /** H3 计划里的提示词：只写英文正文（中文留在面板里对照），音效单列一段 */
-  function buildPlanPrompt(unit) {
+  function buildPlanPrompt(unit, video = null) {
     const text = String(unit.promptEn || "").trim() || String(unit.promptZh || "").trim();
     const sound = String(unit.soundscape || "").trim();
     // 音效只有中文时：默认照原样写入；勾选「音效段跳过中文」后写纯英文提示词
@@ -1306,6 +1368,24 @@ export function createStoryboardPanel(root, app) {
       // 原生 Ref2V：按参考位顺序写明每张图的用途，保持英文
       const bindings = unitPictureBindings(unit, "en");
       if (bindings.length && !/<Picture\s+1>/i.test(text)) lines.push("", ...bindings);
+    }
+    // 手动从上一镜末帧取的图排在参考图最后一位
+    const extra = continuityPick(unit);
+    if (extra) {
+      const index = unitReferenceCodes(unit).length + 1;
+      lines.push(
+        "",
+        `<Picture ${index}> is ${extra.cropped ? "a cropped detail" : "the last frame"} from the previous shot ${
+          extra.code || ""
+        }: use it only for the same wardrobe, props, materials, colour and wear; it does not define this shot's framing or background.`
+      );
+    }
+    // 跨镜衔接：上一镜视频接在 ref_videos.ref_video_0
+    if (video) {
+      lines.push(
+        "",
+        `<Video 1> is the previous shot ${video.unitId}: keep the same characters, wardrobe, props, set dressing, light direction and colour grade. Use it only as a continuity reference; this shot's framing, camera angle and action are defined above.`
+      );
     }
     // 原生 Ref2V 的参考音频按 ref_audios 顺序编号，提示词里要说清「只要音色」
     const audioPicks = unitAudioPicks(unit);
@@ -1655,7 +1735,9 @@ export function createStoryboardPanel(root, app) {
     let list = slots || referenceImageSlots(app);
     if (!list.length) return { ok: true, message: "工作流里没有 Ref2V 参考位（Picture）" };
     const picks = unitReferenceCodes(unit);
-    // Autogrow 参考位被前端收起时，先把要用的 Picture 补回来
+    // 手动取的上一镜末帧排在参考图最后一位
+    const extra = continuityPick(unit);
+    if (extra) picks.push(extra);
     if (picks.length > list.length) list = ensureReferenceSlots(app, picks.length);
     // 素材连接参考条件必须经过规则桥（没有就自动插入并改接）
     list = routeReferenceSlotsThroughBridge(app);
@@ -1774,16 +1856,298 @@ export function createStoryboardPanel(root, app) {
     return { ok: !failed.length, message: parts.join("；") };
   }
 
+  /** 同场的前一镜（跨场不接，避免把上一场的环境带进新场） */
+  function previousUnit(unit) {
+    const units = state.doc ? state.doc.units : [];
+    const at = units.findIndex((item) => item.id === unit.id);
+    if (at <= 0) return null;
+    const prev = units[at - 1];
+    return prev && prev.scene === unit.scene ? prev : null;
+  }
+
+  /** 本镜手动从上一镜末帧取的图（卡片上的「取上一镜末帧」） */
+  function continuityPick(unit) {
+    const saved = state.continuity[unit.id];
+    if (!saved || !saved.name) return null;
+    const entry = libraryStore.files.find((item) => item.name === saved.name);
+    if (!entry) return null;
+    return { code: saved.from || "", entry, continuity: true, cropped: !!saved.cropped };
+  }
+
+  /** 输出目录里的视频用 annotated 路径交给 VHS_LoadVideo */
+  function annotatedVideoName(shot) {
+    const path = shot.subfolder ? `${shot.subfolder}/${shot.filename}` : shot.filename;
+    return shot.type && shot.type !== "input" ? `[${shot.type}]${path}` : path;
+  }
+
+  /**
+   * 跨镜衔接：把上一镜生成出来的视频接到 ref_videos.ref_video_0（提示词里的 <Video 1>）。
+   * 只有同一场才接；没有上一镜输出时把面板写过的视频位关掉，避免串片。
+   */
+  function applyUnitVideo(unit) {
+    lastVideoBound = null;
+    if (!referenceVideoSlots(app).length) return { ok: true, message: "" };
+    const prev = previousUnit(unit);
+    const shot = prev ? state.shots[prev.id] : null;
+    if (!prev || !shot || !shot.filename) {
+      const cleared = clearVideoSlotsFrom(app, 0);
+      return { ok: true, message: cleared ? `已断开上一镜的参考视频（${cleared} 路）` : "" };
+    }
+    const result = ensureReferenceVideo(app, 0, annotatedVideoName(shot));
+    if (!result.ok) return { ok: true, message: `参考视频没接上：${result.message}` };
+    lastVideoBound = { unitId: prev.id, filename: shot.filename };
+    return { ok: true, message: `参考视频 ← ${prev.id}` };
+  }
+
+  // ---------- 取上一镜末帧：可拖框裁出局部（跨景别时当局部参考） ----------
+
+  let sampler = null; // { unit, prev, image, rect, wrap }
+
+  function closeSampler() {
+    if (sampler && sampler.wrap && sampler.wrap.parentNode) sampler.wrap.parentNode.removeChild(sampler.wrap);
+    sampler = null;
+  }
+
+  function openSampler(unit) {
+    const prev = previousUnit(unit);
+    const shot = prev ? state.shots[prev.id] : null;
+    if (!prev || !shot || !shot.filename) {
+      toast("上一镜还没有可用的输出视频", "err");
+      return;
+    }
+    closeSampler();
+    const query = new URLSearchParams({
+      filename: shot.filename,
+      subfolder: shot.subfolder || "",
+      type: shot.type || "output",
+    });
+    const url = typeof api.apiURL === "function" ? api.apiURL(`/view?${query.toString()}`) : `/view?${query}`;
+    const wrap = document.createElement("div");
+    wrap.className = "sb-modal";
+    wrap.innerHTML = `
+      <div class="sb-modal-box">
+        <div class="sb-modal-head">
+          <b>取上一镜末帧</b>
+          <span class="sb-hint">${escapeHtml(prev.id)} · ${escapeHtml(shot.filename)}</span>
+          <button class="sb-btn dim" data-sampler="close">×</button>
+        </div>
+        <div class="sb-modal-canvas"><canvas data-el="sampler-canvas"></canvas></div>
+        <div class="sb-modal-foot">
+          <span class="sb-hint grow" data-el="sampler-info">正在读取视频…</span>
+          <button class="sb-btn" data-sampler="reset">整帧</button>
+          <button class="sb-btn primary" data-sampler="ok">插入本镜参考</button>
+        </div>
+      </div>`;
+    root.appendChild(wrap);
+    sampler = { unit, prev, image: null, rect: null, wrap };
+    const canvas = wrap.querySelector('[data-el="sampler-canvas"]');
+    const info = wrap.querySelector('[data-el="sampler-info"]');
+    canvas.width = 640;
+    canvas.height = 360;
+    bindSamplerEvents(wrap, canvas, info);
+    loadSamplerFrame(url, canvas, info);
+  }
+
+  /** 用隐藏的 <video> 抽最后一帧画进 canvas（不需要 ffmpeg） */
+  function loadSamplerFrame(url, canvas, info) {
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.src = url;
+    const fail = () => {
+      if (info) info.textContent = "浏览器读不了这个视频：可以在剪辑软件里截一帧拖进素材库";
+    };
+    video.addEventListener("error", fail, { once: true });
+    video.addEventListener(
+      "loadedmetadata",
+      () => {
+        try {
+          video.currentTime = Math.max(0, (video.duration || 1) - 0.08);
+        } catch (error) {
+          fail();
+        }
+      },
+      { once: true }
+    );
+    video.addEventListener(
+      "seeked",
+      () => {
+        if (!sampler) return;
+        const max = 1280;
+        const scale = Math.min(1, max / Math.max(1, video.videoWidth || max));
+        const image = document.createElement("canvas");
+        image.width = Math.max(2, Math.round((video.videoWidth || 640) * scale));
+        image.height = Math.max(2, Math.round((video.videoHeight || 360) * scale));
+        image.getContext("2d").drawImage(video, 0, 0, image.width, image.height);
+        sampler.image = image;
+        drawSampler(canvas, info);
+      },
+      { once: true }
+    );
+  }
+
+  /** 画底图 + 选区；选区存的是原图像素坐标 */
+  function drawSampler(canvas, info) {
+    const st = sampler;
+    if (!st || !st.image) return;
+    const box = canvas.parentElement ? canvas.parentElement.clientWidth : 640;
+    const width = Math.max(240, Math.min(760, box - 2));
+    const scale = width / st.image.width;
+    canvas.width = Math.max(2, Math.round(st.image.width * scale));
+    canvas.height = Math.max(2, Math.round(st.image.height * scale));
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(st.image, 0, 0, canvas.width, canvas.height);
+    if (st.rect) {
+      const k = canvas.width / st.image.width;
+      const x = st.rect.x * k;
+      const y = st.rect.y * k;
+      const w = st.rect.w * k;
+      const h = st.rect.h * k;
+      ctx.fillStyle = "rgba(0,0,0,.45)";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.clearRect(x, y, w, h);
+      ctx.drawImage(st.image, st.rect.x, st.rect.y, st.rect.w, st.rect.h, x, y, w, h);
+      ctx.strokeStyle = "#3b82f6";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x, y, w, h);
+    }
+    updateSamplerInfo(info);
+  }
+
+  function updateSamplerInfo(info) {
+    if (!info || !sampler || !sampler.image) return;
+    const rect = sampler.rect;
+    info.textContent = rect
+      ? `选区 ${Math.round(rect.w)}×${Math.round(rect.h)} 像素，拖框可重选`
+      : `整帧 ${sampler.image.width}×${sampler.image.height}，在画面上拖框可裁出局部`;
+  }
+
+  function bindSamplerEvents(wrap, canvas, info) {
+    let start = null;
+    const toCanvas = (event) => {
+      const rect = canvas.getBoundingClientRect();
+      const width = canvas.width || 1;
+      const height = canvas.height || 1;
+      return {
+        x: Math.max(0, Math.min(width, ((event.clientX - rect.left) / Math.max(1, rect.width)) * width)),
+        y: Math.max(0, Math.min(height, ((event.clientY - rect.top) / Math.max(1, rect.height)) * height)),
+      };
+    };
+    canvas.addEventListener("pointerdown", (event) => {
+      if (!sampler || !sampler.image) return;
+      event.preventDefault();
+      start = toCanvas(event);
+      sampler.rect = null;
+      drawSampler(canvas, info);
+    });
+    canvas.addEventListener("pointermove", (event) => {
+      if (!start || !sampler || !sampler.image) return;
+      const at = toCanvas(event);
+      const k = sampler.image.width / (canvas.width || 1);
+      const x = Math.min(start.x, at.x) * k;
+      const y = Math.min(start.y, at.y) * k;
+      const w = Math.abs(at.x - start.x) * k;
+      const h = Math.abs(at.y - start.y) * k;
+      sampler.rect = w > 4 && h > 4 ? { x, y, w, h } : null;
+      drawSampler(canvas, info);
+    });
+    const end = () => {
+      start = null;
+    };
+    canvas.addEventListener("pointerup", end);
+    canvas.addEventListener("pointercancel", end);
+    wrap.addEventListener("click", (event) => {
+      const action = event.target.closest("[data-sampler]");
+      if (!action) return;
+      const cmd = action.dataset.sampler;
+      if (cmd === "close") closeSampler();
+      else if (cmd === "reset") {
+        if (sampler) sampler.rect = null;
+        drawSampler(canvas, info);
+      } else if (cmd === "ok") commitSampler();
+    });
+  }
+
+  /** 裁图上传后进素材库，并绑定到本镜最后一个参考位 */
+  async function commitSampler() {
+    const st = sampler;
+    if (!st || !st.image) {
+      toast("视频还没读出来，等一秒再点", "err");
+      return;
+    }
+    const image = st.image;
+    const rect = st.rect;
+    const sx = rect ? Math.max(0, Math.round(rect.x)) : 0;
+    const sy = rect ? Math.max(0, Math.round(rect.y)) : 0;
+    const sw = rect ? Math.min(image.width - sx, Math.round(rect.w)) : image.width;
+    const sh = rect ? Math.min(image.height - sy, Math.round(rect.h)) : image.height;
+    if (sw < 24 || sh < 24) {
+      toast("选区太小了，重新框一下", "err");
+      return;
+    }
+    const cropped = sw < image.width - 2 || sh < image.height - 2;
+    const out = document.createElement("canvas");
+    out.width = sw;
+    out.height = sh;
+    out.getContext("2d").drawImage(image, sx, sy, sw, sh, 0, 0, sw, sh);
+    const blob = await new Promise((resolve) => out.toBlob(resolve, "image/png"));
+    if (!blob) {
+      toast("截图失败", "err");
+      return;
+    }
+    // 不能用 _last_v01 命名：那会被当成上一镜自己的尾帧
+    const name = `${st.prev.id}_contin${cropped ? "_crop" : ""}_v01.png`;
+    const file = new File([blob], name, { type: "image/png" });
+    const form = new FormData();
+    form.append("image", file, name);
+    form.append("overwrite", "true");
+    let uploaded = "";
+    try {
+      const response = await api.fetchApi("/upload/image", { method: "POST", body: form });
+      if (response.ok) {
+        const data = await response.json();
+        uploaded = data && data.name ? (data.subfolder ? `${data.subfolder}/${data.name}` : data.name) : "";
+      }
+    } catch (error) {
+      uploaded = "";
+    }
+    if (!uploaded) {
+      toast("上传失败：确认 ComfyUI 正在运行", "err");
+      return;
+    }
+    const entry = {
+      name,
+      path: `session:${name}`,
+      image: true,
+      audio: false,
+      frame: true,
+      codes: [st.prev.id],
+      units: [st.prev.id],
+      uploadedName: uploaded,
+      note: `上一镜 ${st.prev.id} 末帧${cropped ? "局部" : ""}`,
+    };
+    libraryStore.files = [entry, ...libraryStore.files.filter((item) => item.name !== name)];
+    saveLibraryStore();
+    state.continuity[st.unit.id] = { name, uploadedName: uploaded, cropped, from: st.prev.id };
+    persist();
+    closeSampler();
+    renderList();
+    toast(`${name} 已入库，应用这一镜时会接在参考图最后一位`, "ok");
+  }
+
   /** 按工作流的素材入口选择：先写首尾帧，再按 Ref2V 参考位或首帧处理素材 */
   async function applyVisualToUnit(unit) {
+    const video = applyUnitVideo(unit);
     const frames = await applyUnitFrames(unit);
     const audio = await applyUnitAudio(unit);
     const slots = referenceImageSlots(app);
     const refs = slots.length
       ? await applyReferenceImagesToUnit(unit, slots)
       : await applyImageToUnit(unit);
-    const message = [frames.message, refs.message, audio.message].filter(Boolean).join("；");
-    return { ok: frames.ok && refs.ok && audio.ok, message };
+    const message = [video.message, frames.message, refs.message, audio.message].filter(Boolean).join("；");
+    return { ok: video.ok && frames.ok && refs.ok && audio.ok, message };
   }
 
   async function applyImageToUnit(unit) {
@@ -2153,6 +2517,14 @@ export function createStoryboardPanel(root, app) {
       : "";
     const firstFrame = pickUnitFrame(unit, "first");
     const lastFrame = pickUnitFrame(unit, "last");
+    const prevUnit = previousUnit(unit);
+    const prevShot = prevUnit ? state.shots[prevUnit.id] : null;
+    const cont = state.continuity[unit.id];
+    const contLine = cont
+      ? `<div class="sb-line"><b>衔接帧</b> ${escapeHtml(cont.name)}${cont.cropped ? "（局部）" : ""}${
+          cont.from ? ` ← ${escapeHtml(cont.from)} 末帧` : ""
+        }</div>`
+      : "";
     const frameLine =
       firstFrame || lastFrame
         ? `<div class="sb-line"><b>首尾帧</b> ${escapeHtml(
@@ -2188,6 +2560,7 @@ export function createStoryboardPanel(root, app) {
         ${imageLine}
         ${libLine}
         ${frameLine}
+        ${contLine}
         <div class="sb-params" title="采样器 ${escapeHtml(unit.params?.sampler || "")} / 调度器 ${escapeHtml(
           unit.params?.scheduler || ""
         )} · shift ${escapeHtml(unit.params?.shift ?? "")} · 降噪 ${escapeHtml(
@@ -2196,6 +2569,13 @@ export function createStoryboardPanel(root, app) {
         <div class="sb-actions">
           <button class="sb-btn primary" data-act="all">① 应用这一镜</button>
           <button class="sb-btn" data-act="copy">复制提示词</button>
+          ${
+            prevShot
+              ? `<button class="sb-btn" data-act="sample" title="从上一镜输出的最后一帧取图，可拖框裁出局部">${
+                  cont ? "重取末帧" : "取上一镜末帧"
+                }</button>`
+              : ""
+          }
           <button class="sb-btn dim" data-act="expand">${expanded ? "收起" : "更多"}</button>
         </div>
         ${
@@ -2338,7 +2718,7 @@ export function createStoryboardPanel(root, app) {
       // 应用前确保 Plan 里有自动生成的参考图规则
       ensurePlanRulePrefix();
       const target = state.planIndex == null ? plan.active : state.planIndex;
-      const result = writeH3Shot(app, target, { prompt: buildPlanPrompt(unit) });
+      const result = writeH3Shot(app, target, { prompt: buildPlanPrompt(unit, lastVideoBound) });
       if (!result.ok) return { ok: false, message: result.message };
       state.planIndex = result.index;
       renderPlanRow();
@@ -2363,7 +2743,7 @@ export function createStoryboardPanel(root, app) {
     if (!promptNode) return { ok: false, message: "未找到正向提示词节点，请先打开工作流" };
     const stockRef2V = referenceImageSlots(app).length > 0;
     const text = stockRef2V
-      ? buildPlanPrompt(unit)
+      ? buildPlanPrompt(unit, lastVideoBound)
       : buildPrompt(unit, { mode: settings().mode, quality: settings().quality });
     if (!text) return { ok: false, message: "该单元没有提示词内容" };
     if (!setPromptText(app, promptNode, text)) {
@@ -2668,11 +3048,13 @@ export function createStoryboardPanel(root, app) {
 
   /** 把一镜写进工作流（提示词 / 参数 / 素材），返回是否成功与回执 */
   async function applyUnitCore(unit, options = {}) {
+    appliedUnitId = unit.id;
+    // 先接素材与上一镜视频：提示词里要按实际接上的 <Video 1> 写衔接说明
+    const image = await applyVisualToUnit(unit);
     const prompt = applyPromptToUnit(unit);
     const params = applyParamsToUnit(unit, options);
-    const image = await applyVisualToUnit(unit);
     const ok = prompt.ok && params.ok && image.ok;
-    const detail = [prompt.message, params.message, image.message].filter(Boolean).join("；");
+    const detail = [image.message, prompt.message, params.message].filter(Boolean).join("；");
     return { ok, detail };
   }
 
@@ -2754,7 +3136,7 @@ export function createStoryboardPanel(root, app) {
   async function waitForPrompt(promptId) {
     const started = Date.now();
     while (!autoStopRequested) {
-      if (Date.now() - started > 6 * 60 * 60 * 1000) return { ok: false, message: "等待超时" };
+      if (Date.now() - started > 6 * 60 * 60 * 1000) return { ok: false, message: "等待超时", videos: [] };
       try {
         const response = await api.fetchApi(`/history/${encodeURIComponent(promptId)}`, { cache: "no-store" });
         if (response.ok) {
@@ -2762,7 +3144,11 @@ export function createStoryboardPanel(root, app) {
           const entry = data && data[promptId];
           if (entry && entry.status && (entry.status.completed || entry.status.status_str)) {
             const failed = entry.status.status_str && entry.status.status_str !== "success";
-            return { ok: !failed, message: failed ? "生成失败，详情看 ComfyUI 控制台" : "" };
+            return {
+              ok: !failed,
+              message: failed ? "生成失败，详情看 ComfyUI 控制台" : "",
+              videos: collectOutputVideos(entry),
+            };
           }
         }
       } catch (error) {
@@ -2770,7 +3156,7 @@ export function createStoryboardPanel(root, app) {
       }
       await sleep(2000);
     }
-    return { ok: false, message: "已停止" };
+    return { ok: false, message: "已停止", videos: [] };
   }
 
   async function runAuto() {
@@ -2827,6 +3213,13 @@ export function createStoryboardPanel(root, app) {
           }
           break;
         }
+        // 记下这一镜的输出视频：下一镜会把它接到 ref_videos（<Video 1>）
+        if (finished.videos && finished.videos.length) {
+          state.shots[unit.id] = { ...finished.videos[0], at: Date.now() };
+        } else {
+          delete state.shots[unit.id];
+        }
+        persist();
         // 生成成功才算这一镜完成，避免中途停止时把没出片的镜标成已完成
         markApplied(unit, true);
         advancePlanAfterApply();
@@ -3314,6 +3707,11 @@ export function createStoryboardPanel(root, app) {
     if (act === "expand") {
       state.expanded[unit.id] = !state.expanded[unit.id];
       renderList();
+      return;
+    }
+
+    if (act === "sample") {
+      openSampler(unit);
       return;
     }
 
