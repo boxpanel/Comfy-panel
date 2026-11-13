@@ -187,17 +187,31 @@ export function parseTierParams(lines) {
   return params;
 }
 
-/** 从「对白／音效」里取出能写进提示词的现场声，去掉“无对白/物理声独立生成”这类制作说明 */
+/**
+ * 从「对白／音效」里取出能写进提示词的现场声。
+ * 只留音效与环境声：台词交给参考音频和 prompt 里的 dialogue，
+ * 「音色参考 assets/…」「语音只借音色，不复制…」「物理声独立生成」这类制作说明
+ * 一律不写进提示词，否则 H3 会把说明当成台词念出来。
+ */
 function soundscapeOf(value) {
   let text = String(value || "").trim();
   if (!text) return "";
-  text = text
-    .replace(/^无对白\s*[。；;，,、]?\s*/g, "")
-    .replace(/^有对白\s*[：:]\s*/g, "")
-    .replace(/^音效\s*[：:]\s*/g, "")
-    .replace(/物理声独立生成[^。]*。/g, "")
-    .replace(/不用参考音频[^。]*。/g, "");
-  return text.replace(/\s+/g, " ").trim();
+  text = text.replace(/^无对白\s*[。；;，,、]?\s*/g, "").replace(/^有对白\s*[：:]\s*/g, "");
+  const DROP = /只借|音色参考|不复制参考|不复制原句|物理声独立生成|不用参考音频/;
+  const sentences = text
+    .split("。")
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence && !DROP.test(sentence));
+  let out = sentences.join("。");
+  // 有「音效：」就只取这一段，说话人、台词和起说/说完的时间都不进提示词
+  const fx = out.match(/音效\s*[：:]\s*([\s\S]*)$/);
+  if (fx) {
+    out = fx[1];
+  } else if (out.includes("「")) {
+    // 没有音效段时兜底：引号里的台词和它后面的时间说明都去掉
+    out = out.replace(/「[^」]*」[^。]*/g, "");
+  }
+  return out.replace(/^[。；;，,\s]+/, "").replace(/\s+/g, " ").trim();
 }
 
 /** 解析「场 2 的档位：U01、U04 用 A 档；……」 */

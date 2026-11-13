@@ -3,7 +3,7 @@
  * 面板：导入分镜手册 → 解析成单元 → 一键写入提示词和参数
  */
 import { app } from "../../scripts/app.js";
-import { createStoryboardPanel } from "./storyboard_ui.js?v=20261112l";
+import { createStoryboardPanel } from "./storyboard_ui.js?v=20261113a";
 
 const TAB_ICON_STYLE_ID = "sb-tab-icon-style";
 const TAB_ICON_CSS = `
