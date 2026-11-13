@@ -67,7 +67,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 2;
-const PANEL_VERSION = `v53.7 · 接续开关 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.8 · 视频转存 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -1907,8 +1907,32 @@ export function createStoryboardPanel(root, app) {
   }
 
   /**
+   * 让后端把上一镜视频转存到 input/storyboard_ref，返回 VHS 可用的普通路径。
+   * 返回 null = 后端不支持这个接口（退回 [output] 方案）；"" = 文件确实不可用。
+   */
+  async function stageVideoForLoad(shot) {
+    if (!shot || !shot.filename) return "";
+    try {
+      const response = await api.fetchApi("/storyboard/ref-video", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename: shot.filename,
+          subfolder: shot.subfolder || "",
+          type: shot.type || "output",
+        }),
+      });
+      if (response.status === 404) return null;
+      const data = await response.json().catch(() => null);
+      return data && data.ok && data.name ? data.name : "";
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /**
    * 跨镜衔接：把上一镜生成出来的视频接到 ref_videos.ref_video_0（提示词里的 <Video 1>）。
-   * 只有同一场才接；没有上一镜输出时把面板写过的视频位关掉，避免串片。
+   * 只有同一场才接；视频读不到就跳过，绝不让整批自动模式停在一镜上。
    */
   async function applyUnitVideo(unit) {
     lastVideoBound = null;
@@ -1923,14 +1947,25 @@ export function createStoryboardPanel(root, app) {
       const cleared = clearVideoSlotsFrom(app, 0);
       return { ok: true, message: cleared ? `已断开上一镜的参考视频（${cleared} 路）` : "" };
     }
-    if (!(await videoReachable(shot))) {
+    // 先让后端转存到 input；文件不在了就跳过接续，别让 VHS 校验把整批停下
+    const staged = await stageVideoForLoad(shot);
+    if (staged === "") {
+      delete state.shots[prev.id];
+      persist();
+      const cleared = clearVideoSlotsFrom(app, 0);
+      return {
+        ok: true,
+        message: `上一镜视频 ${shot.filename} 不在服务器上，已跳过接续${cleared ? "并清空视频位" : ""}`,
+      };
+    }
+    if (!staged && !(await videoReachable(shot))) {
       const cleared = clearVideoSlotsFrom(app, 0);
       return {
         ok: true,
         message: `上一镜视频读不到（${shot.filename}），已跳过接续${cleared ? "并清空视频位" : ""}`,
       };
     }
-    const result = ensureReferenceVideo(app, 0, annotatedVideoName(shot));
+    const result = ensureReferenceVideo(app, 0, staged || annotatedVideoName(shot));
     if (!result.ok) return { ok: true, message: `参考视频没接上：${result.message}` };
     lastVideoBound = { unitId: prev.id, filename: shot.filename };
     return { ok: true, message: `参考视频 ← ${prev.id}` };
@@ -3266,7 +3301,15 @@ export function createStoryboardPanel(root, app) {
         if (card) card.scrollIntoView({ block: "nearest", behavior: "smooth" });
         if (autoStopRequested) break;
         setAutoStatus(`第 ${done + 1} 镜：${unit.id} 已排队，等待生成…`);
-        const queued = await queueCurrentGraph();
+        let queued = await queueCurrentGraph();
+        if (!queued.ok && /Invalid video file/i.test(queued.message)) {
+          // 上一镜视频在服务器上不可用：断开视频位、去掉提示词里的 <Video 1>，再排一次
+          clearVideoSlotsFrom(app, 0);
+          lastVideoBound = null;
+          applyPromptToUnit(unit);
+          console.warn(`[分镜面板] ${unit.id} 参考视频不可用，已断开并重排：${queued.message}`);
+          queued = await queueCurrentGraph();
+        }
         if (!queued.ok) {
           if (autoStopRequested) break;
           setAutoStatus(`排队失败：${queued.message}`);
@@ -3374,6 +3417,10 @@ export function createStoryboardPanel(root, app) {
     state.raw = text;
     state.doc = parseStoryboard(text);
     state.applied = {};
+    // 新一批：上一批的输出视频与衔接帧不再适用，留着会接错片
+    state.shots = {};
+    state.continuity = {};
+    state.autoNote = "";
     // 新分镜：旧的首帧选择和自定义标签都属于上一批素材，清掉避免串用
     const docCodes = new Set();
     state.doc.units.forEach((unit) => (unit.assets || []).forEach((code) => docCodes.add(code)));

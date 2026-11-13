@@ -30,7 +30,7 @@ from server import PromptServer
 WEB_DIRECTORY = "./web"
 
 # 版本号：与 pyproject.toml 的 [project] version 保持一致，发版时一起改
-__version__ = "0.53.7"
+__version__ = "0.53.8"
 
 PLUGIN_DIR = Path(__file__).parent
 
@@ -277,6 +277,89 @@ async def storyboard_update_status(request):
 @PromptServer.instance.routes.post("/storyboard/update/apply")
 async def storyboard_update_apply(request):
     return web.json_response(await asyncio.to_thread(_update_apply))
+
+
+VIDEO_SUFFIXES = {".mp4", ".webm", ".mov", ".mkv", ".m4v"}
+
+
+def _folder_root(kind):
+    if kind == "input":
+        return Path(folder_paths.get_input_directory())
+    if kind == "temp":
+        return Path(folder_paths.get_temp_directory())
+    return Path(folder_paths.get_output_directory())
+
+
+def _inside(root, relative):
+    """把相对路径限制在 root 内，防止路径穿越。"""
+    try:
+        target = (root / relative).resolve()
+        target.relative_to(root.resolve())
+    except (ValueError, OSError):
+        return None
+    return target
+
+
+def _find_storyboard_video(folder, filename):
+    """先精确找；云端可能给文件名加了 _hash_时间 后缀，再按最长前缀兜底。"""
+    exact = _inside(folder, filename)
+    if exact and exact.is_file():
+        return exact
+    if not folder.is_dir():
+        return None
+    stem = Path(filename).stem
+    candidates = []
+    for item in folder.iterdir():
+        if not item.is_file() or item.suffix.lower() not in VIDEO_SUFFIXES:
+            continue
+        name = item.stem
+        if name == stem or name.startswith(stem) or stem.startswith(name):
+            candidates.append(item)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+@PromptServer.instance.routes.post("/storyboard/ref-video")
+async def storyboard_ref_video(request):
+    """把上一镜视频放进 input/storyboard_ref，供 VHS_LoadVideo 读取。
+
+    Compshare 这类环境的 output 可能被云存储清理，或者 VHS 不认
+    `[output]` 前缀；给 input 里放一份副本最稳。找不到文件就返回失败，
+    面板会跳过接续而不是中断整批自动模式。
+    """
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001 - 请求体异常按缺参处理
+        data = {}
+    filename = str(data.get("filename") or "").strip()
+    subfolder = str(data.get("subfolder") or "").strip()
+    kind = str(data.get("type") or "output").strip()
+    if not filename:
+        return web.json_response({"ok": False, "message": "缺少视频文件名"})
+    root = _folder_root(kind)
+    folder = _inside(root, subfolder) if subfolder else root.resolve()
+    if folder is None:
+        return web.json_response({"ok": False, "message": "子目录不合法"})
+    source = _find_storyboard_video(folder, filename)
+    if source is None:
+        return web.json_response({"ok": False, "message": "视频文件不在服务器上（可能已被清理）"})
+    target_dir = Path(folder_paths.get_input_directory()) / "storyboard_ref"
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as error:  # noqa: BLE001
+        return web.json_response({"ok": False, "message": f"创建参考目录失败：{error}"})
+    target = target_dir / source.name
+    try:
+        if not target.is_file() or target.stat().st_size == 0:
+            try:
+                os.link(source, target)  # 同盘硬链接，不占额外空间
+            except Exception:  # noqa: BLE001 - 跨盘时退回复制
+                shutil.copy2(source, target)
+    except Exception as error:  # noqa: BLE001
+        return web.json_response({"ok": False, "message": f"转存视频失败：{error}"})
+    return web.json_response({"ok": True, "name": f"storyboard_ref/{source.name}", "source": source.name})
 
 
 def _install_no_cache_middleware():
