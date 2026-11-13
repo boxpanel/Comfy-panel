@@ -1,4 +1,4 @@
-"""分镜提示词面板（ComfyUI 自定义节点包）。
+﻿"""分镜提示词面板（ComfyUI 自定义节点包）。
 
 只提供前端侧边栏扩展：导入分镜手册（Markdown），解析成单元卡片，
 再把提示词与档位参数写入当前工作流的对应节点。
@@ -9,12 +9,17 @@
 另外提供两个只读/下载型接口，用于补齐工作流缺失的模型文件：
   GET  /storyboard/models/status
   POST /storyboard/models/ensure
+
+以及两个 git 更新接口（面板右上角的更新按钮用）：
+  GET  /storyboard/update/status
+  POST /storyboard/update/apply
 """
 
 import asyncio
 import logging
 import os
 import shutil
+import subprocess
 import urllib.request
 from pathlib import Path
 
@@ -25,7 +30,9 @@ from server import PromptServer
 WEB_DIRECTORY = "./web"
 
 # 版本号：与 pyproject.toml 的 [project] version 保持一致，发版时一起改
-__version__ = "0.51.0"
+__version__ = "0.52.0"
+
+PLUGIN_DIR = Path(__file__).parent
 
 LOGGER = logging.getLogger("StoryboardPanel")
 
@@ -68,7 +75,7 @@ NODE_CLASS_MAPPINGS = {"StoryboardRefRuleBridge": StoryboardRefRuleBridge}
 NODE_DISPLAY_NAME_MAPPINGS = {"StoryboardRefRuleBridge": "参考图规则桥（Picture 1-9）"}
 
 # 随包安装的配套工作流
-BUNDLED_WORKFLOW_DIR = Path(__file__).parent / "workflows"
+BUNDLED_WORKFLOW_DIR = PLUGIN_DIR / "workflows"
 
 
 def install_bundled_workflows():
@@ -198,6 +205,78 @@ async def storyboard_models_ensure(request):
         except Exception as error:  # noqa: BLE001 - 网络错误要原样报给前端
             results.append({**item, "status": "error", "error": str(error)})
     return web.json_response({"items": results})
+
+
+# ---------- 面板内更新（只动插件自己的目录，来源是仓库 origin） ----------
+
+def _git(args, timeout=90):
+    """在插件目录里执行 git；禁用交互，没凭据时直接失败而不是卡住。"""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+    return subprocess.run(
+        ["git", "-C", str(PLUGIN_DIR), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+    )
+
+
+def _update_status():
+    if not (PLUGIN_DIR / ".git").exists():
+        return {"ok": False, "git": False, "message": "当前不是 git 安装（zip 装的），无法自动更新"}
+    try:
+        fetch = _git(["fetch", "--quiet"])
+        if fetch.returncode != 0:
+            return {
+                "ok": False,
+                "git": True,
+                "message": (fetch.stderr or fetch.stdout or "拉取远端失败").strip()[:300],
+            }
+        head = _git(["rev-parse", "--short", "HEAD"]).stdout.strip()
+        counts = _git(["rev-list", "--left-right", "--count", "HEAD...@{u}"]).stdout.split()
+        ahead, behind = (int(counts[0]), int(counts[1])) if len(counts) == 2 else (0, 0)
+        dirty = bool(_git(["status", "--porcelain"]).stdout.strip())
+        return {"ok": True, "git": True, "head": head, "ahead": ahead, "behind": behind, "dirty": dirty}
+    except FileNotFoundError:
+        return {"ok": False, "git": False, "message": "服务器没有安装 git"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "git": True, "message": "git 超时（检查服务器到 GitHub 的网络）"}
+    except Exception as error:  # noqa: BLE001 - 原样报给前端
+        return {"ok": False, "git": True, "message": str(error)[:300]}
+
+
+def _update_apply():
+    status = _update_status()
+    if not status.get("ok"):
+        return {"ok": False, "message": status.get("message", "无法检查更新")}
+    if status.get("dirty"):
+        return {"ok": False, "message": "插件目录有本地修改，先还原或提交后再更新"}
+    if not status.get("behind"):
+        return {"ok": True, "changed": [], "message": f"已是最新版本（{status.get('head')}）"}
+    before = _git(["rev-parse", "HEAD"]).stdout.strip()
+    pull = _git(["pull", "--ff-only"])
+    if pull.returncode != 0:
+        return {"ok": False, "message": (pull.stderr or pull.stdout or "git pull 失败").strip()[:300]}
+    after = _git(["rev-parse", "HEAD"]).stdout.strip()
+    changed = [line.strip() for line in _git(["diff", "--name-only", before, after]).stdout.splitlines() if line.strip()]
+    return {
+        "ok": True,
+        "before": before[:7],
+        "after": after[:7],
+        "changed": changed,
+        "restart": "__init__.py" in changed,
+        "message": f"已更新 {before[:7]} → {after[:7]}",
+    }
+
+
+@PromptServer.instance.routes.get("/storyboard/update/status")
+async def storyboard_update_status(request):
+    return web.json_response(await asyncio.to_thread(_update_status))
+
+
+@PromptServer.instance.routes.post("/storyboard/update/apply")
+async def storyboard_update_apply(request):
+    return web.json_response(await asyncio.to_thread(_update_apply))
 
 
 __all__ = ["WEB_DIRECTORY", "NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "__version__"]

@@ -64,7 +64,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 2;
-const PANEL_VERSION = `v51 · 素材上传 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v52 · 手动更新 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -397,6 +397,7 @@ export function createStoryboardPanel(root, app) {
         <button class="sb-btn" data-el="pick">导入分镜</button>
         <button class="sb-btn" data-el="pick-assets">素材库</button>
         <button class="sb-btn" data-el="paste-toggle">粘贴</button>
+        <button class="sb-btn" data-el="update" title="检查并更新插件（git pull，更新后刷新页面）">⟳</button>
       </div>
       <input type="file" data-el="file" accept=".md,.markdown,.txt,text/markdown" hidden>
       <input type="file" data-el="folder" webkitdirectory directory multiple hidden>
@@ -2753,6 +2754,49 @@ export function createStoryboardPanel(root, app) {
     }
   }
 
+  /** 右上角更新按钮：让后端在插件目录里 git pull，前端按改动决定刷新还是提示重启 */
+  async function runPanelUpdate() {
+    const button = el.update;
+    if (button && button.disabled) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "…";
+    }
+    try {
+      const response = await api.fetchApi("/storyboard/update/apply", { method: "POST" });
+      if (response.status === 404) {
+        toast("更新接口不可用：后端没加载，或者是 zip 安装", "err");
+        return;
+      }
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data) {
+        toast("更新失败：接口返回异常", "err");
+        return;
+      }
+      if (!data.ok) {
+        toast(`更新失败：${data.message || "未知原因"}`, "err");
+        return;
+      }
+      if (Array.isArray(data.changed) && data.changed.length) {
+        if (data.restart) {
+          toast(`已更新 ${data.before} → ${data.after}；改了后端代码，请重启 ComfyUI`, "ok");
+        } else {
+          toast(`已更新 ${data.before} → ${data.after}，正在刷新…`, "ok");
+          setTimeout(() => location.reload(), 1200);
+        }
+      } else {
+        toast(data.message || "已是最新版本", "ok");
+      }
+    } catch (error) {
+      toast("更新失败：连不上 ComfyUI", "err");
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.textContent = "⟳";
+      }
+    }
+  }
+
   function importRaw(text, sourceName) {
     if (!text || !text.trim()) {
       toast("内容为空，没有可解析的分镜", "err");
@@ -2831,6 +2875,8 @@ export function createStoryboardPanel(root, app) {
     el.paste.hidden = !el.paste.hidden;
     if (!el.paste.hidden) el.text.focus();
   });
+
+  el.update.addEventListener("click", runPanelUpdate);
 
   el.parse.addEventListener("click", () => importRaw(el.text.value, "粘贴内容"));
 
