@@ -68,7 +68,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 2;
-const PANEL_VERSION = `v53.12 · 面板日志 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.13 · 断线重试 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -3355,6 +3355,30 @@ export function createStoryboardPanel(root, app) {
     }
   }
 
+  /** 502/503/504、断网这类临时故障：等服务器恢复了还能接着跑，不该直接停 */
+  const TRANSIENT_ERROR_RE =
+    /^(50[234]|52\d)$|bad gateway|service unavailable|gateway timeout|failed to fetch|networkerror|load failed|network request failed|econnrefused|timed? ?out/i;
+
+  function isTransientError(message) {
+    return TRANSIENT_ERROR_RE.test(String(message || "").trim());
+  }
+
+  /** 等 ComfyUI 重新可用（重启/重建容器时通常几十秒），超时返回 false */
+  async function waitForServer(timeoutMs = 120000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (autoStopRequested) return false;
+      try {
+        const response = await api.fetchApi("/system_stats", { cache: "no-store" });
+        if (response.ok) return true;
+      } catch (error) {
+        /* 还没起来就继续等 */
+      }
+      await sleep(5000);
+    }
+    return false;
+  }
+
   /** 从 /history 的 status.messages 里提取具体失败原因（节点、异常） */
   function describeFailure(entry) {
     const messages = (entry && entry.status && entry.status.messages) || [];
@@ -3373,6 +3397,22 @@ export function createStoryboardPanel(root, app) {
       if (kind === "execution_interrupted") return "执行被中断（有人点了取消，或服务器重启）";
     }
     return "生成失败，详情看 ComfyUI 控制台";
+  }
+
+  /** 查询某个 prompt 是否还在队列里；接口不可用时返回 null（不做判断） */
+  async function promptInQueue(promptId) {
+    try {
+      const response = await api.fetchApi("/queue", { cache: "no-store" });
+      if (!response.ok) return null;
+      const data = await response.json();
+      const ids = [];
+      for (const item of [...(data.queue_running || []), ...(data.queue_pending || [])]) {
+        if (Array.isArray(item) && item[1]) ids.push(item[1]);
+      }
+      return ids.includes(promptId);
+    } catch (error) {
+      return null;
+    }
   }
 
   /** 等这一条任务在 /history 里出现完成状态 */
@@ -3396,6 +3436,14 @@ export function createStoryboardPanel(root, app) {
         }
       } catch (error) {
         /* 网络抖动就继续等 */
+      }
+      // 90 秒还没出现在 history、队列里也没有：多半是 ComfyUI 重启把任务丢了，
+      // 不能傻等到 6 小时，交给上层重新排队。
+      if (Date.now() - started > 90000) {
+        const inQueue = await promptInQueue(promptId);
+        if (inQueue === false) {
+          return { ok: false, lost: true, message: "任务从队列里消失（ComfyUI 可能重启过）", videos: [] };
+        }
       }
       await sleep(2000);
     }
@@ -3421,6 +3469,7 @@ export function createStoryboardPanel(root, app) {
     const draftBefore = !!state.draftBase;
     if (planInfoSafe() && !draftBefore) enterDraft();
     let done = 0;
+    let lostRetries = 0;
     try {
       while (!autoStopRequested) {
         const unit = nextAutoUnit();
@@ -3460,6 +3509,25 @@ export function createStoryboardPanel(root, app) {
           console.warn(`[分镜面板] ${unit.id} 参考视频不可用，已断开并重排：${queued.message}`);
           queued = await queueCurrentGraph();
         }
+        if (!queued.ok && isTransientError(queued.message) && !autoStopRequested) {
+          // 502/503/504 多半是 ComfyUI 正在重启或网关抖动：等它恢复再排一次，别整批停在这
+          for (let attempt = 1; attempt <= 3 && !autoStopRequested; attempt += 1) {
+            const waitMs = attempt * 15000;
+            setAutoStatus(
+              `ComfyUI 暂时不可用（${queued.message}），${Math.round(waitMs / 1000)} 秒后重试（${attempt}/3）…`
+            );
+            logLine(`${unit.id} 排队遇到 ${queued.message}，等待服务器恢复后重试（${attempt}/3）`, "warn");
+            await sleep(waitMs);
+            if (autoStopRequested) break;
+            if (!(await waitForServer())) {
+              logLine("ComfyUI 超过 2 分钟没有恢复，自动模式停止", "err");
+              break;
+            }
+            queued = await queueCurrentGraph();
+            if (queued.ok || !isTransientError(queued.message)) break;
+          }
+          if (queued.ok) logLine(`${unit.id} 重试排队成功：${queued.promptId}`, "ok");
+        }
         if (!queued.ok) {
           if (autoStopRequested) break;
           setAutoStatus(`排队失败：${queued.message}`);
@@ -3470,6 +3538,13 @@ export function createStoryboardPanel(root, app) {
         logLine(`${unit.id} 已排队：${queued.promptId}`);
         const finished = await waitForPrompt(queued.promptId);
         if (!finished.ok) {
+          // ComfyUI 重启会把队列丢掉：等它起来、重新应用这一镜再排一次
+          if (finished.lost && !autoStopRequested && lostRetries < 2) {
+            lostRetries += 1;
+            logLine(`${unit.id} 任务丢失（ComfyUI 可能重启过），恢复后重新排队（${lostRetries}/2）`, "warn");
+            setAutoStatus(`任务丢失，等待 ComfyUI 恢复（${lostRetries}/2）…`);
+            if (await waitForServer()) continue;
+          }
           if (!autoStopRequested) {
             setAutoStatus(`${unit.id} 生成失败：${finished.message}`);
             toast(`${unit.id} 生成失败，自动模式已停止`, "err");
@@ -3489,6 +3564,7 @@ export function createStoryboardPanel(root, app) {
         advancePlanAfterApply();
         setCardMessage(unit, `${result.detail}；已生成`, "ok");
         done += 1;
+        lostRetries = 0;
         logLine(
           `${unit.id} 完成（本次第 ${done} 镜），输出视频 ${
             finished.videos ? finished.videos.length : 0
