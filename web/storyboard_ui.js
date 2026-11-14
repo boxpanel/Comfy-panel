@@ -68,7 +68,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 2;
-const PANEL_VERSION = `v53.11 · 武打自动 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.12 · 面板日志 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -180,6 +180,12 @@ const CSS = `
 .sb-guide li::marker{color:var(--sb-accent);font-weight:700;}
 .sb-help{display:flex;flex-direction:column;gap:4px;font-size:10.5px;color:var(--sb-muted);line-height:1.45;}
 .sb-help b{color:var(--sb-fg);font-weight:600;}
+.sb-log{display:flex;flex-direction:column;gap:3px;font-size:10px;line-height:1.5;font-family:Consolas,monospace;}
+.sb-log-row{display:flex;gap:6px;color:var(--sb-muted);white-space:pre-wrap;word-break:break-all;}
+.sb-log-row span{color:#6b7280;flex-shrink:0;}
+.sb-log-row.ok{color:#4ade80;}
+.sb-log-row.err{color:#f87171;}
+.sb-log-row.warn{color:#fbbf24;}
 .sb-box{margin:0 10px 8px;border:1px solid var(--sb-line);border-radius:8px;overflow:hidden;flex-shrink:0;min-height:27px;}
 .sb-box>summary{
   cursor:pointer;padding:6px 9px;font-size:11.5px;font-weight:600;color:var(--sb-fg);
@@ -412,6 +418,8 @@ function loadState() {
     autoNote: typeof saved.autoNote === "string" ? saved.autoNote : "",
     // 每镜的武打开关（用户手动覆盖自动判断，true/false）
     fight: saved.fight && typeof saved.fight === "object" ? saved.fight : {},
+    // 面板日志：做过什么、哪里报错（刷新页面后还留着）
+    log: Array.isArray(saved.log) ? saved.log.slice(-200) : [],
     draftBase:
       saved.draftBase && typeof saved.draftBase === "object" && saved.draftBase.width && saved.draftBase.height
         ? saved.draftBase
@@ -654,6 +662,17 @@ export function createStoryboardPanel(root, app) {
       </div>
     </details>
 
+    <details class="sb-box">
+      <summary>面板日志（操作 / 报错）<span class="sb-hint" data-el="log-count"></span></summary>
+      <div class="sb-box-body">
+        <div class="sb-log" data-el="log"></div>
+        <div class="sb-row">
+          <button class="sb-btn" data-el="log-copy">复制日志</button>
+          <button class="sb-btn" data-el="log-clear">清空日志</button>
+        </div>
+      </div>
+    </details>
+
     <div class="sb-toolbar">
       <div class="sb-primary-row">
         <button class="sb-btn primary" data-el="next">▶ 应用下一镜</button>
@@ -706,6 +725,7 @@ export function createStoryboardPanel(root, app) {
   });
 
   el.text.value = state.raw;
+  renderLog();
 
   // 上传可能由上一个面板实例发起：重建后把进度接回当前实例
   libraryListener = () => setLibraryStatus();
@@ -745,12 +765,49 @@ export function createStoryboardPanel(root, app) {
           continuity: state.continuity,
           autoNote: state.autoNote || "",
           fight: state.fight,
+          log: state.log.slice(-200),
           draftBase: state.draftBase,
         })
       );
     } catch (error) {
       /* localStorage 满了也不影响使用 */
     }
+  }
+
+  // ---------- 面板日志：记录操作与报错，刷新后仍在 ----------
+
+  const MAX_LOG = 200;
+
+  function logTime(at) {
+    const date = new Date(at || Date.now());
+    const pad = (value) => String(value).padStart(2, "0");
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  }
+
+  function renderLog() {
+    if (!el.log) return;
+    if (el["log-count"]) el["log-count"].textContent = state.log.length ? `· ${state.log.length} 条` : "";
+    el.log.innerHTML =
+      state.log
+        .map((item) => {
+          const kind = ["info", "ok", "err", "warn"].includes(item.kind) ? item.kind : "info";
+          return `<div class="sb-log-row ${kind}"><span>${logTime(item.at)}</span>${escapeHtml(item.text || "")}</div>`;
+        })
+        .join("") || '<div class="sb-hint">还没有记录</div>';
+    el.log.scrollTop = el.log.scrollHeight;
+  }
+
+  /** 记一条日志，同时输出到浏览器控制台，方便对照服务器终端 */
+  function logLine(message, kind = "info") {
+    if (!message) return;
+    state.log.push({ at: Date.now(), kind, text: String(message) });
+    if (state.log.length > MAX_LOG) state.log.splice(0, state.log.length - MAX_LOG);
+    persist();
+    renderLog();
+    const line = `[分镜面板] ${message}`;
+    if (kind === "err") console.error(line);
+    else if (kind === "warn") console.warn(line);
+    else console.info(line);
   }
 
   function toast(message, kind) {
@@ -762,6 +819,7 @@ export function createStoryboardPanel(root, app) {
     toastTimer = setTimeout(() => {
       el.toast.hidden = true;
     }, 3200);
+    logLine(message, kind === "err" ? "err" : kind === "ok" ? "ok" : "info");
   }
 
   function settings() {
@@ -3356,6 +3414,7 @@ export function createStoryboardPanel(root, app) {
     applying = true;
     el.next.disabled = true;
     if (el.auto) el.auto.checked = true;
+    logLine(`自动模式开始：共 ${state.doc.units.length} 镜，低画质 ${AUTO_MEGAPIXELS}MP`);
     // 低画质：原生 Ref2V 临时降像素档；H3 计划工作流走草稿（10 步 + 半分辨率）
     const before = readResolutionSettings(app);
     const megapixelsBackup = before ? before.megapixels : null;
@@ -3397,6 +3456,7 @@ export function createStoryboardPanel(root, app) {
           clearVideoSlotsFrom(app, 0);
           lastVideoBound = null;
           applyPromptToUnit(unit);
+          logLine(`${unit.id} 参考视频不可用，已断开并重排：${queued.message}`, "warn");
           console.warn(`[分镜面板] ${unit.id} 参考视频不可用，已断开并重排：${queued.message}`);
           queued = await queueCurrentGraph();
         }
@@ -3407,6 +3467,7 @@ export function createStoryboardPanel(root, app) {
           console.error(`[分镜面板] ${unit.id} 排队失败：${queued.message}`);
           break;
         }
+        logLine(`${unit.id} 已排队：${queued.promptId}`);
         const finished = await waitForPrompt(queued.promptId);
         if (!finished.ok) {
           if (!autoStopRequested) {
@@ -3428,6 +3489,12 @@ export function createStoryboardPanel(root, app) {
         advancePlanAfterApply();
         setCardMessage(unit, `${result.detail}；已生成`, "ok");
         done += 1;
+        logLine(
+          `${unit.id} 完成（本次第 ${done} 镜），输出视频 ${
+            finished.videos ? finished.videos.length : 0
+          } 个`,
+          "ok"
+        );
         console.info(
           `[分镜面板] ${unit.id} 完成（本次第 ${done} 镜），输出视频 ${finished.videos ? finished.videos.length : 0} 个`
         );
@@ -3580,6 +3647,31 @@ export function createStoryboardPanel(root, app) {
   });
 
   el.update.addEventListener("click", runPanelUpdate);
+
+  el["log-copy"].addEventListener("click", () => {
+    const text = state.log
+      .map((item) => `${logTime(item.at)} [${item.kind || "info"}] ${item.text || ""}`)
+      .join("\n");
+    if (!text) {
+      toast("日志还是空的", "err");
+      return;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        () => toast("日志已复制到剪贴板", "ok"),
+        () => toast("复制失败，请手动选中日志文本", "err")
+      );
+    } else {
+      toast("当前环境不支持剪贴板", "err");
+    }
+  });
+
+  el["log-clear"].addEventListener("click", () => {
+    state.log = [];
+    persist();
+    renderLog();
+    toast("日志已清空");
+  });
 
   el.parse.addEventListener("click", () => importRaw(el.text.value, "粘贴内容"));
 

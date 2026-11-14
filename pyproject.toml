@@ -1,6 +1,6 @@
 ﻿[project]
 name = "comfyui-storyboard-panel"
-version = "0.53.11"
+version = "0.53.12"
 description = "分镜提示词面板：把 Markdown 分镜手册写入 MiniMax H3 工作流（提示词 / 素材 / 参考音频 / 画幅）"
 requires-python = ">=3.9"
 license = { text = "MIT" }
