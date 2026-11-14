@@ -67,8 +67,8 @@ import {
 } from "./storyboard_bridge.js?v=20261113e";
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
-const SETTINGS_REV = 2;
-const PANEL_VERSION = `v53.13 · 断线重试 · ${BRIDGE_BUILD}`;
+const SETTINGS_REV = 3;
+const PANEL_VERSION = `v53.14 · 台词剥离 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -90,8 +90,8 @@ const DEFAULT_SETTINGS = {
   dropCnSound: false,
   // 跨镜接续：把上一镜输出视频接到参考视频1（<Video 1>）
   continuityVideo: true,
-  // 按分镜文字自动开关武打 LoRA（Combat / Fight Flow / Motion Repair）
-  fightAuto: true,
+  // 按分镜文字自动开关武打 LoRA：导演口径默认不用，需要时手动勾
+  fightAuto: false,
   referenceRule: "",
   nodeIds: { positive: "", negative: "", sampler: "", latent: "", image: "" },
 };
@@ -429,6 +429,8 @@ function loadState() {
       ...settings,
       // v2 起参考素材默认按原图上传（白底交给提示词规则处理），旧设置里的抠图开关一并关掉
       cutout: settingsRev >= 2 ? settings.cutout === true : false,
+      // v3 起武打 LoRA 默认不自动开：导演口径本工作流不用动作 LoRA，需要时手动勾
+      fightAuto: settingsRev >= 3 ? settings.fightAuto === true : false,
       nodeIds: { ...DEFAULT_SETTINGS.nodeIds, ...(settings.nodeIds || {}) },
     },
     doc: null,
@@ -688,7 +690,7 @@ export function createStoryboardPanel(root, app) {
       </div>
       <div class="sb-frame">
         <label class="sb-chk"><input type="checkbox" data-el="fightauto" title="按分镜文字判断本镜是否武打，自动开关武打 LoRA 与速度滑块"> 武打自动</label>
-        <span class="sb-hint grow">武打镜开 LoRA，其余旁路；卡片上的「武打」徽标可手动改</span>
+        <span class="sb-hint grow">默认关；勾上后武打镜开 LoRA，卡片上的「武打」徽标可手动改</span>
       </div>
       <div class="sb-progress">
         <div class="track"><div class="bar" data-el="progress-bar"></div></div>
@@ -2086,11 +2088,12 @@ export function createStoryboardPanel(root, app) {
     return { ok: true, message: `参考视频 ← ${prev.id}` };
   }
 
-  /** 本镜是否武打：用户手动覆盖优先，否则按分镜文字自动判断 */
+  /** 本镜是否武打：用户手动覆盖优先；自动判断只在「武打自动」勾上时生效 */
   function unitFight(unit) {
     if (typeof state.fight[unit.id] === "boolean") {
       return { on: state.fight[unit.id], manual: true };
     }
+    if (settings().fightAuto === false) return { on: false, manual: false, autoOff: true };
     return { on: looksLikeFight(unit), manual: false };
   }
 
@@ -2752,7 +2755,7 @@ export function createStoryboardPanel(root, app) {
           </span>
           <span class="sb-fight ${fight.on ? "on" : ""}" data-act="fight" title="武打 LoRA：${
             fight.on ? "开" : "关"
-          }（${fight.manual ? "手动" : "按分镜自动"}），点击切换">武打${fight.manual ? "·手动" : ""}</span>
+          }（${fight.manual ? "手动" : fight.autoOff ? "自动已关" : "按分镜自动"}），点击切换">武打${fight.manual ? "·手动" : ""}</span>
           <span class="sb-check">${applied ? "✓" : ""}</span>
         </div>
         <div class="sb-zh ${expanded ? "open" : ""}">${escapeHtml(unit.promptZh || "（无中文提示词）")}</div>
@@ -3677,7 +3680,12 @@ export function createStoryboardPanel(root, app) {
     if (!stats.total) {
       toast("已读入文件，但没找到镜号标题：看列表里的格式说明", "err");
     } else {
-      toast(`已解析 ${stats.scenes} 场 / ${stats.total} 个单元${sourceName ? "：" + sourceName : ""}`, "ok");
+      // 导演口径：每卡都要有「保留」行，漏了等于把服装/道具交给模型自由发挥
+      const missing = state.doc.units.filter((unit) => !String(unit.retention || "").trim());
+      const tail = missing.length
+        ? `；${missing.length} 镜缺「保留」：${missing.slice(0, 5).map((unit) => unit.id).join("、")}${missing.length > 5 ? "…" : ""}`
+        : "";
+      toast(`已解析 ${stats.scenes} 场 / ${stats.total} 个单元${sourceName ? "：" + sourceName : ""}${tail}`, missing.length ? "err" : "ok");
     }
   }
 

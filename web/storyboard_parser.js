@@ -214,6 +214,22 @@ function soundscapeOf(value) {
   return out.replace(/^[。；;，,\s]+/, "").replace(/\s+/g, " ").trim();
 }
 
+/**
+ * 画面 prompt 里不许出现台词和 <Audio N> 槽位：
+ * 台词只走「对白／音效」栏和参考音频，写进画面会被模型当成字幕或念白。
+ * 口型、字幕禁令这类画面指令保留。
+ */
+function stripDialogueFromPrompt(value) {
+  let text = String(value || "");
+  if (!text) return "";
+  // 旧卡把整段「对白：<Audio 1> …」挂在提示词末尾，整段删掉（实测 3 卡，都在末尾）
+  text = text.replace(/\s*(?:对白|Dialogue)\s*[：:][\s\S]*$/i, "");
+  // 兜底：残留的音频槽位与引号台词
+  text = text.replace(/<Audio\s*\d+>/gi, "");
+  text = text.replace(/「[^」]*」/g, "");
+  return text.replace(/\s{2,}/g, " ").replace(/^[。；;，,\s]+/, "").trim();
+}
+
 /** 解析「场 2 的档位：U01、U04 用 A 档；……」 */
 export function parseTierAssignments(text) {
   const map = {};
@@ -556,6 +572,9 @@ export function parseStoryboard(rawText) {
     delete unitData.assetsText;
     delete unitData._lastField;
     unitData.soundscape = soundscapeOf(unitData.audio);
+    // 台词与 <Audio N> 不写进画面 prompt（导演口径：台词只进音频栏）
+    unitData.promptZh = stripDialogueFromPrompt(unitData.promptZh);
+    unitData.promptEn = stripDialogueFromPrompt(unitData.promptEn);
 
     unitData.sceneName = (result.scenes.find((item) => item.no === unitData.scene) || {}).name || "";
 
