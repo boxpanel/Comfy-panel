@@ -12,7 +12,7 @@ import {
   parseFrameName,
   parseStoryboard,
   summarize,
-} from "./storyboard_parser.js?v=20261113f";
+} from "./storyboard_parser.js?v=20261115a";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -69,7 +69,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
-const PANEL_VERSION = `v53.18 · 接点 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.19 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;

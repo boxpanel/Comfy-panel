@@ -195,13 +195,17 @@ export function parseTierParams(lines) {
  */
 function soundscapeOf(value) {
   let text = String(value || "").trim();
-  if (!text) return "";
+  if (!text || /^无[。；;]?$/.test(text)) return "";
   text = text.replace(/^无对白\s*[。；;，,、]?\s*/g, "").replace(/^有对白\s*[：:]\s*/g, "");
   const DROP = /只借|音色参考|不复制参考|不复制原句|物理声独立生成|不用参考音频/;
+  // 「说话人（情绪）：台词」是台词，不是音效；但「音效：」「环境声：」要留着
+  const isDialogue = (sentence) =>
+    !/^(?:音效|环境声|环境音)/.test(sentence) &&
+    /^[^：:。；]{1,12}(?:（[^）]{0,10}）)?\s*[：:]/.test(sentence);
   const sentences = text
     .split("。")
     .map((sentence) => sentence.trim())
-    .filter((sentence) => sentence && !DROP.test(sentence));
+    .filter((sentence) => sentence && !DROP.test(sentence) && !isDialogue(sentence));
   let out = sentences.join("。");
   // 有「音效：」就只取这一段，说话人、台词和起说/说完的时间都不进提示词
   const fx = out.match(/音效\s*[：:]\s*([\s\S]*)$/);
@@ -224,6 +228,9 @@ function stripDialogueFromPrompt(value) {
   if (!text) return "";
   // 旧卡把整段「对白：<Audio 1> …」挂在提示词末尾，整段删掉（实测 3 卡，都在末尾）
   text = text.replace(/\s*(?:对白|Dialogue)\s*[：:][\s\S]*$/i, "");
+  // 带音频模型的包会在画面句后面挂 <d>[Chinese] 台词</d> 和一句时长指令，都不属于画面
+  text = text.replace(/<d>[\s\S]*?<\/d>/gi, "");
+  text = text.replace(/Complete the sentence by approximately\s*\d{1,2}:\d{1,2}(?:\.\d+)?/gi, "");
   // 兜底：残留的音频槽位与引号台词
   text = text.replace(/<Audio\s*\d+>/gi, "");
   text = text.replace(/「[^」]*」/g, "");
@@ -598,6 +605,9 @@ export function parseStoryboard(rawText) {
 export function normalizeJoint(value) {
   const text = String(value || "").trim().toLowerCase();
   if (!text) return "unknown";
+  // 「未标注接点 · 先按连续处理…请人工确认是否应改为硬切」整句里同时出现「连续」和「硬切」，
+  // 必须先认出「未标注」，否则会被后面的关键字误判成硬切。
+  if (/未标注|unknown|待确认|请人工确认/.test(text)) return "unknown";
   if (/hard|硬切/.test(text)) return "hard";
   if (/cut|切换/.test(text)) return "cut";
   if (/cont|连续/.test(text)) return "cont";
@@ -649,7 +659,12 @@ export function parsePromptPack(data, titleOverride) {
 
   (Array.isArray(pack.shots) ? pack.shots : []).forEach((shot, index) => {
     const no = String(shot && shot.shot != null ? shot.shot : index + 1).padStart(2, "0");
-    const video = splitInlineNegative(shot && shot.videoPrompt);
+    const rawVideo = String((shot && shot.videoPrompt) || "");
+    const video = splitInlineNegative(rawVideo);
+    // 带音频模型的包把台词写成 <d>[Chinese] …</d>；台词只进「对白」栏，不进画面
+    const spoken = String((rawVideo.match(/<d>\s*(?:\[[^\]]*\])?\s*([\s\S]*?)<\/d>/i) || [])[1] || "").trim();
+    const audioText = String((shot && shot.audio) || "").trim();
+    const audio = /^无[。；;]?$/.test(audioText) ? "" : audioText || spoken;
     const durationText = String((shot && shot.duration) || "").trim();
     const seconds = durationSeconds(durationText);
     const zhParts = [shot.scene, shot.subject, shot.environment, shot.camera, shot.elapsed, shot.anchor]
@@ -675,15 +690,15 @@ export function parsePromptPack(data, titleOverride) {
       shot: "",
       camera: String((shot && shot.camera) || "").trim(),
       assets: extractAssets(
-        [shot.subject, shot.environment, shot.anchor, shot.scene, shot.audio].filter(Boolean).join(" ")
+        [shot.subject, shot.environment, shot.anchor, shot.scene, audio].filter(Boolean).join(" ")
       ),
       promptZh: zhParts.join("。"),
-      promptEn: video.text,
+      promptEn: stripDialogueFromPrompt(video.text),
       // 提示词包的英文正文已经包含中文摘要的全部信息，拼提示词时不再重复中文
       englishOnly: true,
       negative: video.negative,
-      audio: String((shot && shot.audio) || "").trim(),
-      soundscape: soundscapeOf(shot && shot.audio),
+      audio,
+      soundscape: soundscapeOf(audio),
       // 提示词包没有「保留」行，用主体与空间锚点当连续性约束
       retention: [shot.subject, shot.anchor].filter(Boolean).join("；"),
       continuity: String((shot && shot.continuity) || "").trim(),
@@ -700,18 +715,39 @@ export function parsePromptPack(data, titleOverride) {
     units.push(unit);
     scene.units.push(unit);
 
-    // 导演工具偶尔会中途截断：提示词不以句末标点收尾基本就是断了
-    const tail = unit.promptEn.slice(-1);
-    if (!unit.promptEn || !/[.!?。！？"')\]]/.test(tail)) {
-      warnings.push(`${unit.id} 视频提示词疑似被截断：…${unit.promptEn.slice(-24) || "（空）"}`);
+    // 导演工具偶尔会中途截断。中文成稿本来就不带句号，不能按句末标点判断；
+    // 只有英文成稿缺句末标点、字段括号没配上、或者整段为空，才算截断。
+    const joined = [shot.subject, shot.environment, shot.firstFrame, shot.lastFrame, unit.promptEn]
+      .map((part) => String(part || ""))
+      .join("|");
+    const openParen = (joined.match(/（/g) || []).length;
+    const closeParen = (joined.match(/）/g) || []).length;
+    const cjkCount = (unit.promptEn.match(/[\u4e00-\u9fff]/g) || []).length;
+    const mostlyEnglish = unit.promptEn.length > 0 && cjkCount / unit.promptEn.length < 0.2;
+    const tail = unit.promptEn.trim().slice(-1);
+    if (!unit.promptEn) {
+      warnings.push(`${unit.id} 视频提示词为空，这一镜在包里被截断了`);
+    } else if (openParen !== closeParen) {
+      warnings.push(`${unit.id} 字段括号没闭合，疑似被截断：…${unit.promptEn.slice(-24)}`);
+    } else if (mostlyEnglish && !/[.!?。！？"')\]]/.test(tail)) {
+      warnings.push(`${unit.id} 视频提示词疑似被截断：…${unit.promptEn.slice(-24)}`);
     }
   });
 
   if (!units.length) warnings.push("JSON 里没有 shots 镜头列表");
-  // 导演规则：每场第一个镜头一律硬切
+  // 导演规律：每场第一个镜头一律硬切
   if (units.length && units[0].joint === "unknown") {
     warnings.push(`${units[0].id} 未标注接点；每场第一个镜头应为硬切`);
   }
+  // 分场之间会空出若干镜号，缺号本身正常，但要让用户知道总表不是 1..N 连续
+  const numbers = units.map((unit) => Number(unit.label)).filter((value) => value > 0).sort((a, b) => a - b);
+  const gaps = [];
+  let cursor = 1;
+  numbers.forEach((value) => {
+    if (value > cursor) gaps.push(`${cursor}-${value - 1}`);
+    cursor = Math.max(cursor, value + 1);
+  });
+  if (gaps.length) warnings.push(`镜头号不连续：缺 ${gaps.join("、")}（分场空号，确认不是漏镜）`);
   return {
     title,
     scenes: [scene],
@@ -800,6 +836,8 @@ export function parsePromptPackCsv(text, titleOverride) {
       const key = keys[index];
       if (key) shot[key] = String(cell || "").trim();
     });
+    // 接点列写的是整句说明（「未标注接点 · 先按连续处理…」），原样留作参考
+    if (shot.joint) shot.jointReference = shot.joint;
     return shot;
   });
   return parsePromptPack({ title: "", shots }, titleOverride);
@@ -810,12 +848,20 @@ export function parsePromptPackTxt(text, titleOverride) {
   const source = String(text || "").replace(/^\uFEFF/, "");
   const shots = [];
   let current = null;
+  // 接点行有两种位置：新包写在本镜标题之后、正文之前；旧包写在下一条标题之前
+  let awaitingJoint = false;
   let pendingJoint = "";
   for (const line of source.split(/\r?\n/)) {
     const jointMatch = line.match(/^接点\s*[：:]\s*(.*)$/);
     if (jointMatch) {
-      // 接点行写在本镜的【镜头】标题之前，属于下一镜
-      pendingJoint = jointMatch[1].trim();
+      const value = jointMatch[1].trim();
+      if (current && awaitingJoint) {
+        current.joint = value;
+        current.jointReference = value;
+        awaitingJoint = false;
+      } else {
+        pendingJoint = value;
+      }
       continue;
     }
     const head = line.match(/^【镜头\s*(\d+)】\s*(.*)$/);
@@ -830,10 +876,14 @@ export function parsePromptPackTxt(text, titleOverride) {
         jointReference: pendingJoint,
       };
       pendingJoint = "";
+      awaitingJoint = true;
       shots.push(current);
       continue;
     }
-    if (current) current.videoPrompt = `${current.videoPrompt ? `${current.videoPrompt}\n` : ""}${line}`;
+    if (current) {
+      current.videoPrompt = `${current.videoPrompt ? `${current.videoPrompt}\n` : ""}${line}`;
+      if (line.trim()) awaitingJoint = false;
+    }
   }
   for (const shot of shots) shot.videoPrompt = String(shot.videoPrompt || "").trim();
   return parsePromptPack({ title: "", shots }, titleOverride);
