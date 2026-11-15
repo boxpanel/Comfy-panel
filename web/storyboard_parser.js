@@ -62,8 +62,8 @@ const TIER_DEFAULTS = {
   },
 };
 
-// 素材编号：S 角色 / C 服装 / P 道具 / E 场景 / ST 风格，兼容旧的 R / T / G / T-P
-const ASSET_RE = /\b(?:ST|T-P|T|R|C|S|P|G|E)-\d{2}[a-zA-Z]?(?:-E\d)?\b/g;
+// 素材编号：S 角色 / C 服装 / P 道具 / E 场景 / ST 风格 / A 其他，兼容旧的 R / T / G / T-P
+const ASSET_RE = /\b(?:ST|T-P|T|R|C|S|P|G|E|A)-\d{2}[a-zA-Z]?(?:-E\d)?\b/g;
 
 /** 统一素材编号大小写：s-04a -> S-04a，t-p01 -> T-P01 */
 export function normalizeAssetCode(code) {
@@ -263,6 +263,21 @@ function spokenOf(value) {
   return match ? match[1].trim() : "";
 }
 
+/** 出包偶尔把分隔符和残留字段行写进正文：孤立的 #、---、`- 首帧补充：无` 都要剔掉 */
+function stripPackNoise(value) {
+  const kept = String(value || "")
+    .split(/\r?\n/)
+    .filter((line) => {
+      const text = line.trim();
+      if (!text) return true;
+      if (/^#{1,6}$/.test(text)) return false;
+      if (/^(?:-{3,}|\*{3,})$/.test(text)) return false;
+      if (/^[-*]\s*[\u4e00-\u9fff]{1,8}\s*[：:]/.test(text)) return false;
+      return true;
+    });
+  return kept.join("\n").trim();
+}
+
 /** 解析「场 2 的档位：U01、U04 用 A 档；……」 */
 export function parseTierAssignments(text) {
   const map = {};
@@ -316,6 +331,10 @@ const SHOT_FIELD_MAP = {
 };
 
 function shotFieldOf(key) {
+  // 「视频提示词（台词）」「视频提示词补充」都是台词，不占画面提示词
+  if (/^视频提示词\s*(?:[（(]台词[）)]|补充)/.test(key)) return "dialogueText";
+  // 「首帧补充：无」这类残留行直接忽略
+  if (/^(?:首帧|尾帧)补充$/.test(key) || /^主体口型$/.test(key)) return null;
   return SHOT_FIELD_MAP[key] || fieldOf(key);
 }
 
@@ -448,7 +467,7 @@ function extractAssets(text) {
   return found;
 }
 
-const ASSET_CODE_PATTERN = "(?:ST|T-P|T|R|C|S|P|G|E)-\\d{2}[a-zA-Z]?(?:-E\\d)?";
+const ASSET_CODE_PATTERN = "(?:ST|T-P|T|R|C|S|P|G|E|A)-\\d{2}[a-zA-Z]?(?:-E\\d)?";
 
 /**
  * 从手册里抽「素材编号 → 中文名」对照表。
@@ -478,7 +497,7 @@ export function parseAssetNames(text) {
   const headingRe = new RegExp(`^#{1,6}\\s*(${ASSET_CODE_PATTERN})\\s*[·・|｜:：]?\\s*([^\\n]*)$`, "gm");
   while ((match = headingRe.exec(text))) {
     const parts = match[2].split(/[·・|｜]/).map((part) => part.trim()).filter(Boolean);
-    if (parts.length >= 2) put(match[1], `${parts[0]}·${parts[1]}`);
+    if (parts.length >= 2) put(match[1], `${parts[0]}·${parts.slice(1).join("·")}`);
     else if (parts.length === 1) put(match[1], parts[0]);
   }
 
@@ -642,7 +661,7 @@ export function parseStoryboard(rawText) {
       }
       if (/^#{1,4}\s/.test(line)) {
         unit = null;
-      } else if (unit._lastField && line.trim() && !/^\s*[-*|>]/.test(line)) {
+      } else if (unit._lastField && line.trim() && !/^\s*[-*|>#]/.test(line)) {
         const field = unit._lastField;
         unit[field] = `${unit[field]} ${line.trim()}`.trim();
       }
@@ -696,8 +715,16 @@ export function parseStoryboard(rawText) {
 
     unitData.soundscape = soundscapeOf(unitData.audio);
     // 台词与 <Audio N> 不写进画面 prompt（导演口径：台词只进音频栏）
-    unitData.promptZh = stripDialogueFromPrompt(unitData.promptZh);
-    unitData.promptEn = stripDialogueFromPrompt(unitData.promptEn);
+    unitData.promptZh = stripDialogueFromPrompt(stripPackNoise(unitData.promptZh));
+    unitData.promptEn = stripDialogueFromPrompt(stripPackNoise(unitData.promptEn));
+    unitData.continuity = stripPackNoise(unitData.continuity);
+    unitData.firstFramePrompt = stripPackNoise(unitData.firstFramePrompt);
+    unitData.lastFramePrompt = stripPackNoise(unitData.lastFramePrompt);
+
+    // 镜头卡缺「时长」就写不了帧数，交付时要让使用者看见
+    if (shotStyle && !String(unitData.durationText || "").trim()) {
+      result.warnings.push(`${unitData.id} 缺「时长」，这镜没法按秒数算帧数`);
+    }
 
     unitData.sceneName = (result.scenes.find((item) => item.no === unitData.scene) || {}).name || "";
 
@@ -784,11 +811,13 @@ export function parsePromptPack(data, titleOverride) {
 
   (Array.isArray(pack.shots) ? pack.shots : []).forEach((shot, index) => {
     const no = String(shot && shot.shot != null ? shot.shot : index + 1).padStart(2, "0");
-    const rawVideo = String((shot && shot.videoPrompt) || "");
+    // 双语包会把英文放 videoPromptEn；中文正文仍留在 videoPrompt
+    const rawZhVideo = stripPackNoise(String((shot && shot.videoPrompt) || ""));
+    const rawVideo = stripPackNoise(String((shot && shot.videoPromptEn) || "")) || rawZhVideo;
     const video = splitInlineNegative(rawVideo);
     // 带音频模型的包把台词写成 <d>[Chinese] …</d>；台词只进「对白」栏，不进画面
-    const spoken = spokenOf(rawVideo);
-    const audioText = String((shot && shot.audio) || "").trim();
+    const spoken = spokenOf(rawVideo) || spokenOf(rawZhVideo);
+    const audioText = stripPackNoise(String((shot && shot.audio) || "")).trim();
     const audio = /^无[。；;]?$/.test(audioText) ? "" : audioText || spoken;
     // 出包端按镜头文本里的素材名自动匹配出的编号，可能为空
     const assetRefs = (Array.isArray(shot && shot.assetRefs) ? shot.assetRefs : [])
@@ -796,13 +825,21 @@ export function parsePromptPack(data, titleOverride) {
       .filter(Boolean);
     const durationText = String((shot && shot.duration) || "").trim();
     const seconds = durationSeconds(durationText);
-    const zhParts = [shot.scene, shot.subject, shot.environment, shot.camera, shot.elapsed, shot.anchor]
-      .map((part) => String(part || "").trim().replace(/[。；;]+$/, ""))
+    if (!durationText) {
+      warnings.push(`S01-U${no} 缺「时长」，这镜只能按 B 档默认帧数走`);
+    }
+    const zhFields = [shot.scene, shot.subject, shot.environment, shot.camera, shot.elapsed, shot.anchor]
+      .map((part) => stripPackNoise(String(part || "")).replace(/[。；;]+$/, ""))
       .filter(Boolean);
+    // 英文正文单独给的时候，中文正文本身就是画面摘要，别丢
+    if (rawZhVideo && rawZhVideo !== rawVideo && /[\u4e00-\u9fff]/.test(rawZhVideo)) {
+      zhFields.push(stripDialogueFromPrompt(rawZhVideo));
+    }
+    const zhParts = zhFields;
     // 参数沿用执行卡的 B 档，但帧数按本镜时长算，画幅按提示词里写的比例
     const params = { ...tiers.B };
     if (seconds > 0) params.frames = Math.max(5, Math.round(seconds * (Number(params.fps) || 16)));
-    const ratioText = [shot.videoPrompt, shot.firstFrame, shot.scene, shot.environment]
+    const ratioText = [shot.videoPrompt, shot.videoPromptEn, shot.firstFrame, shot.scene, shot.environment]
       .filter(Boolean)
       .join(" ");
     if (/9\s*[:：]\s*16/.test(ratioText)) {
@@ -817,7 +854,7 @@ export function parsePromptPack(data, titleOverride) {
       durationText,
       duration: seconds,
       shot: "",
-      camera: String((shot && shot.camera) || "").trim(),
+      camera: stripPackNoise(String((shot && shot.camera) || "")).trim(),
       assets: [
         ...new Set([
           ...assetRefs,
@@ -833,22 +870,22 @@ export function parsePromptPack(data, titleOverride) {
       soundscape: soundscapeOf(audio),
       // 提示词包没有「保留」行，用主体与空间锚点当连续性约束
       retention: [shot.subject, shot.anchor].filter(Boolean).join("；"),
-      continuity: String((shot && shot.continuity) || "").trim(),
-      acceptance: String((shot && shot.acceptance) || "").trim(),
-      risk: String((shot && shot.risk) || "").trim(),
-      firstFramePrompt: String((shot && shot.firstFrame) || "").trim(),
-      lastFramePrompt: String((shot && shot.lastFrame) || "").trim(),
+      continuity: stripPackNoise(String((shot && shot.continuity) || "")).trim(),
+      acceptance: stripPackNoise(String((shot && shot.acceptance) || "")).trim(),
+      risk: stripPackNoise(String((shot && shot.risk) || "")).trim(),
+      firstFramePrompt: stripPackNoise(String((shot && shot.firstFrame) || "")).trim(),
+      lastFramePrompt: stripPackNoise(String((shot && shot.lastFrame) || "")).trim(),
       // 接点：决定这镜要不要沿用上一镜画面
       joint: normalizeJoint(shot && shot.joint),
-      jointReference: String((shot && shot.jointReference) || "").trim(),
+      jointReference: stripPackNoise(String((shot && shot.jointReference) || "")).trim(),
       tier: "B",
       params,
     };
     units.push(unit);
     scene.units.push(unit);
 
-    // 导演工具偶尔会中途截断。中文成稿本来就不带句号，不能按句末标点判断；
-    // 字段以冒号/逗号结尾、括号没配上、整段为空，或者英文成稿缺句末标点，才算截断。
+    // 导演工具偶尔会中途截断。中文成稿本来就不带句号，英文成稿也常常整句不加标点，
+    // 所以只看「整段为空」「字段以冒号/逗号结尾」「括号没配上」这三种硬信号。
     const joined = [shot.subject, shot.environment, shot.firstFrame, shot.lastFrame, unit.promptEn]
       .map((part) => String(part || ""))
       .join("|");
@@ -857,9 +894,6 @@ export function parsePromptPack(data, titleOverride) {
     const dangling = [shot.subject, shot.environment, shot.camera, shot.firstFrame, shot.lastFrame, rawVideo]
       .map((part) => String(part || "").trim())
       .some((part) => /[：:，,、]$/.test(part));
-    const cjkCount = (unit.promptEn.match(/[\u4e00-\u9fff]/g) || []).length;
-    const mostlyEnglish = unit.promptEn.length > 0 && cjkCount / unit.promptEn.length < 0.2;
-    const tail = unit.promptEn.trim().slice(-1);
     if (!unit.promptEn) {
       const text = `${unit.id} 视频提示词为空，这一镜在包里被截断了`;
       warnings.push(text);
@@ -868,8 +902,6 @@ export function parsePromptPack(data, titleOverride) {
       warnings.push(`${unit.id} 有字段以冒号/逗号结尾，疑似被截断：…${unit.promptEn.slice(-24)}`);
     } else if (openParen !== closeParen) {
       warnings.push(`${unit.id} 字段括号没闭合，疑似被截断：…${unit.promptEn.slice(-24)}`);
-    } else if (mostlyEnglish && !/[.!?。！？"')\]]/.test(tail)) {
-      warnings.push(`${unit.id} 视频提示词疑似被截断：…${unit.promptEn.slice(-24)}`);
     }
   });
 
@@ -918,7 +950,10 @@ export function parsePromptPack(data, titleOverride) {
         id,
         kind: String((item && item.kind) || "").trim(),
         name: String((item && item.name) || "").trim(),
+        // 出图文件名可能用另一套编号（S-01 的图叫 R-01_sheet_v01.png），记下来做别名
+        file: String((item && item.file) || "").trim(),
         prompt: String((item && item.prompt) || "").trim(),
+        promptEn: String((item && item.promptEn) || "").trim(),
         consistency: String((item && item.consistency) || "").trim(),
         negative: String((item && item.negative) || "").trim(),
       };
@@ -929,6 +964,19 @@ export function parsePromptPack(data, titleOverride) {
     const label = [item.kind, item.name].filter(Boolean).join("·");
     if (label) assetNames[item.id] = label;
   });
+  // 别名表：文件名里的编号 → 镜头 assetRefs 用的编号（文件名常带下划线，先把下划线当分隔符）
+  const assetAlias = {};
+  assets.forEach((item) => {
+    if (!item.file) return;
+    const fileCode = extractAssets(String(item.file).replace(/_/g, " "))[0];
+    if (fileCode && fileCode !== item.id) assetAlias[fileCode] = item.id;
+  });
+  const aliasPairs = Object.keys(assetAlias).map((code) => `${code}→${assetAlias[code]}`);
+  if (aliasPairs.length) {
+    warnings.push(
+      `素材文件名与编号不一致：${aliasPairs.join("、")}（已按文件名自动对上；正文里同名编号若指别人，请改文件名）`
+    );
+  }
 
   return {
     title,
@@ -939,6 +987,7 @@ export function parsePromptPack(data, titleOverride) {
     warnings,
     assets,
     assetNames,
+    assetAlias,
     negativePrompt: String(pack.negativePrompt || "").trim(),
     source: "pack",
   };

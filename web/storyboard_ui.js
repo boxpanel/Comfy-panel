@@ -13,7 +13,7 @@ import {
   parseFrameName,
   parseStoryboard,
   summarize,
-} from "./storyboard_parser.js?v=20261115d";
+} from "./storyboard_parser.js?v=20261115e";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -70,7 +70,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
-const PANEL_VERSION = `v53.23 · 接点 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.24 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -904,7 +904,8 @@ export function createStoryboardPanel(root, app) {
   }
 
   function assetName(code) {
-    return (state.doc && state.doc.assetNames && state.doc.assetNames[code]) || "";
+    const names = (state.doc && state.doc.assetNames) || {};
+    return names[code] || names[canonicalCode(code)] || "";
   }
 
   function assetCategory(code) {
@@ -931,9 +932,7 @@ export function createStoryboardPanel(root, app) {
     const rows = codes
       .map((code) => {
         const list = usage[code];
-        const local = libraryFiles().filter(
-          (entry) => !entry.audio && (entry.codes || []).includes(code)
-        );
+        const local = libraryFiles().filter((entry) => !entry.audio && entryHasCode(entry, code));
         const localEntry = local[0];
         const localText = local.length ? `${localEntry.name}${local.length > 1 ? ` 等 ${local.length} 个` : ""}` : "";
         const noteMark = localEntry && localEntry.note ? "〔提示词〕" : "";
@@ -1055,12 +1054,23 @@ export function createStoryboardPanel(root, app) {
     return libraryStore.files;
   }
 
+  /** 08 的 asset.file 可能用旧编号（S-01 的图叫 R-01_sheet_v01.png），统一走别名 */
+  function canonicalCode(code) {
+    const alias = (state.doc && state.doc.assetAlias) || {};
+    return alias[code] || code;
+  }
+
+  function entryHasCode(entry, code) {
+    const target = canonicalCode(code);
+    return (entry.codes || []).some((item) => item === code || item === target);
+  }
+
   function libraryMatches(unit) {
     return libraryFiles().filter((entry) => {
       if (entry.audio) return false;
       if (entry.frame) return false;
       if (entry.units && entry.units.includes(unit.id)) return true;
-      return (entry.codes || []).some((code) => unit.assets.includes(code));
+      return (unit.assets || []).some((code) => entryHasCode(entry, code));
     });
   }
 
@@ -1071,7 +1081,7 @@ export function createStoryboardPanel(root, app) {
     for (const code of unit.assets || []) {
       for (const entry of libraryFiles()) {
         if (!entry.audio || seen.has(entry.path)) continue;
-        if (!(entry.codes || []).includes(code)) continue;
+        if (!entryHasCode(entry, code)) continue;
         seen.add(entry.path);
         picks.push({ code, entry });
       }
@@ -1304,7 +1314,7 @@ export function createStoryboardPanel(root, app) {
     const entries = libraryFiles().filter((entry) => entry.image);
     const pairs = [];
     for (const code of codes) {
-      const entry = entries.find((item) => (item.codes || []).includes(code));
+      const entry = entries.find((item) => entryHasCode(item, code));
       if (entry) pairs.push({ code, entry });
     }
     if (!pairs.length) {
@@ -1825,7 +1835,7 @@ export function createStoryboardPanel(root, app) {
       const best = new Map();
       for (const entry of libraryFiles()) {
         if (!entry.image || entry.frame) continue;
-        if (!(entry.codes || []).includes(code)) continue;
+        if (!entryHasCode(entry, code)) continue;
         const stem = entry.name.replace(/\.\w+$/, "");
         const versioned = /^(.*)_v(\d{2})$/i.exec(stem);
         const key = versioned ? versioned[1].toLowerCase() : stem.toLowerCase();
@@ -2458,7 +2468,7 @@ export function createStoryboardPanel(root, app) {
     const preferred =
       (explicit ? { name: explicit } : null) ||
       uploaded.find((item) => item.entry.units.includes(unit.id)) ||
-      uploaded.find((item) => item.entry.codes.some((code) => /^S-/.test(code))) ||
+      uploaded.find((item) => item.entry.codes.some((code) => /^S-/.test(canonicalCode(code)))) ||
       uploaded[0];
     if (!preferred) return { ok: true, message: "" };
 
