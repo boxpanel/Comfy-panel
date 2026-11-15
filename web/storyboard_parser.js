@@ -594,6 +594,94 @@ export function parseStoryboard(rawText) {
   return result;
 }
 
+/** 把视频提示词末尾内嵌的「Negative: …」拆出来，避免和负向提示词重复 */
+function splitInlineNegative(value) {
+  const text = String(value || "").trim();
+  const at = text.search(/(?:^|\s)Negative\s*[:：]/i);
+  if (at < 0) return { text, negative: "" };
+  return {
+    text: text.slice(0, at).trim(),
+    negative: text.slice(at).replace(/^\s*Negative\s*[:：]\s*/i, "").trim(),
+  };
+}
+
+/**
+ * 解析「提示词包」JSON（豆包导演导出的 08-分镜表.json）：
+ * { title, summary, negativePrompt, shots: [{ shot, duration, subject, environment,
+ *   camera, elapsed, anchor, scene, firstFrame, lastFrame, videoPrompt, audio,
+ *   continuity, acceptance, risk }] }
+ * 每镜映射成一张卡：视频提示词 → 英文提示词，其余中文字段合成中文提示词。
+ */
+export function parsePromptPack(data) {
+  const pack = data && typeof data === "object" ? data : {};
+  const title = String(pack.title || "提示词包").trim();
+  const tiers = cloneTierDefaults();
+  const scene = { no: 1, name: title, units: [], note: String(pack.summary || "").trim() };
+  const units = [];
+  const warnings = [];
+
+  (Array.isArray(pack.shots) ? pack.shots : []).forEach((shot, index) => {
+    const no = String(shot && shot.shot != null ? shot.shot : index + 1).padStart(2, "0");
+    const video = splitInlineNegative(shot && shot.videoPrompt);
+    const durationText = String((shot && shot.duration) || "").trim();
+    const zhParts = [shot.scene, shot.subject, shot.environment, shot.camera, shot.elapsed, shot.anchor]
+      .map((part) => String(part || "").trim().replace(/[。；;]+$/, ""))
+      .filter(Boolean);
+    const unit = {
+      id: `S01-U${no}`,
+      scene: 1,
+      label: no,
+      sceneName: title,
+      durationText,
+      duration: parseFloat(durationText) || 0,
+      shot: "",
+      camera: String((shot && shot.camera) || "").trim(),
+      assets: extractAssets(
+        [shot.subject, shot.environment, shot.anchor, shot.scene].filter(Boolean).join(" ")
+      ),
+      promptZh: zhParts.join("。"),
+      promptEn: video.text,
+      negative: video.negative,
+      audio: String((shot && shot.audio) || "").trim(),
+      soundscape: soundscapeOf(shot && shot.audio),
+      // 提示词包没有「保留」行，用主体与空间锚点当连续性约束
+      retention: [shot.subject, shot.anchor].filter(Boolean).join("；"),
+      continuity: String((shot && shot.continuity) || "").trim(),
+      acceptance: String((shot && shot.acceptance) || "").trim(),
+      risk: String((shot && shot.risk) || "").trim(),
+      firstFramePrompt: String((shot && shot.firstFrame) || "").trim(),
+      lastFramePrompt: String((shot && shot.lastFrame) || "").trim(),
+      tier: "B",
+      params: { ...tiers.B },
+    };
+    units.push(unit);
+    scene.units.push(unit);
+
+    // 导演工具偶尔会中途截断：提示词不以句末标点收尾基本就是断了
+    const tail = unit.promptEn.slice(-1);
+    if (!unit.promptEn || !/[.!?。！？"')\]]/.test(tail)) {
+      warnings.push(`${unit.id} 视频提示词疑似被截断：…${unit.promptEn.slice(-24) || "（空）"}`);
+    }
+  });
+
+  if (!units.length) warnings.push("JSON 里没有 shots 镜头列表");
+  return { title, scenes: [scene], units, params: tiers, tierMap: {}, warnings, source: "pack" };
+}
+
+/** 统一入口：JSON 提示词包走 parsePromptPack，其余仍按 Markdown 执行卡解析 */
+export function parseAnyStoryboard(text) {
+  const trimmed = String(text || "").trim();
+  if (trimmed.startsWith("{")) {
+    try {
+      const data = JSON.parse(trimmed);
+      if (data && Array.isArray(data.shots) && data.shots.length) return parsePromptPack(data);
+    } catch (error) {
+      /* 不是合法 JSON 就退回 Markdown 解析 */
+    }
+  }
+  return parseStoryboard(text);
+}
+
 /** 按设定拼接提示词：中文动作句 → 英文动作句 → 质感串，用句号连接 */
 export function buildPrompt(unit, options = {}) {
   if (!unit) return "";
