@@ -641,23 +641,36 @@ export function parsePromptPack(data, titleOverride) {
     const no = String(shot && shot.shot != null ? shot.shot : index + 1).padStart(2, "0");
     const video = splitInlineNegative(shot && shot.videoPrompt);
     const durationText = String((shot && shot.duration) || "").trim();
+    const seconds = durationSeconds(durationText);
     const zhParts = [shot.scene, shot.subject, shot.environment, shot.camera, shot.elapsed, shot.anchor]
       .map((part) => String(part || "").trim().replace(/[。；;]+$/, ""))
       .filter(Boolean);
+    // 参数沿用执行卡的 B 档，但帧数按本镜时长算，画幅按提示词里写的比例
+    const params = { ...tiers.B };
+    if (seconds > 0) params.frames = Math.max(5, Math.round(seconds * (Number(params.fps) || 16)));
+    const ratioText = [shot.videoPrompt, shot.firstFrame, shot.scene, shot.environment]
+      .filter(Boolean)
+      .join(" ");
+    if (/9\s*[:：]\s*16/.test(ratioText)) {
+      params.width = 720;
+      params.height = 1280;
+    }
     const unit = {
       id: `S01-U${no}`,
       scene: 1,
       label: no,
       sceneName: title,
       durationText,
-      duration: durationSeconds(durationText),
+      duration: seconds,
       shot: "",
       camera: String((shot && shot.camera) || "").trim(),
       assets: extractAssets(
-        [shot.subject, shot.environment, shot.anchor, shot.scene].filter(Boolean).join(" ")
+        [shot.subject, shot.environment, shot.anchor, shot.scene, shot.audio].filter(Boolean).join(" ")
       ),
       promptZh: zhParts.join("。"),
       promptEn: video.text,
+      // 提示词包的英文正文已经包含中文摘要的全部信息，拼提示词时不再重复中文
+      englishOnly: true,
       negative: video.negative,
       audio: String((shot && shot.audio) || "").trim(),
       soundscape: soundscapeOf(shot && shot.audio),
@@ -669,7 +682,7 @@ export function parsePromptPack(data, titleOverride) {
       firstFramePrompt: String((shot && shot.firstFrame) || "").trim(),
       lastFramePrompt: String((shot && shot.lastFrame) || "").trim(),
       tier: "B",
-      params: { ...tiers.B },
+      params,
     };
     units.push(unit);
     scene.units.push(unit);
@@ -813,7 +826,9 @@ export function buildPrompt(unit, options = {}) {
   if (!unit) return "";
   const mode = options.mode || "zh+en+quality";
   const parts = [];
-  if (mode.includes("zh") && unit.promptZh) parts.push(unit.promptZh);
+  // 提示词包只有英文正文是成稿；同时要中英时不再把中文摘要重复拼一遍
+  const allowZh = mode.includes("zh") && !(unit.englishOnly && mode.includes("en"));
+  if (allowZh && unit.promptZh) parts.push(unit.promptZh);
   if (mode.includes("en") && unit.promptEn) parts.push(unit.promptEn);
   if (mode.includes("quality") && options.quality) parts.push(options.quality);
   const cleaned = parts
