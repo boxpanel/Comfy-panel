@@ -69,7 +69,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
-const PANEL_VERSION = `v53.15 · 提示词包 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.16 · 包解析 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -540,7 +540,7 @@ export function createStoryboardPanel(root, app) {
         <button class="sb-btn" data-el="paste-toggle">粘贴</button>
         <button class="sb-btn" data-el="update" title="检查并更新插件（git pull，更新后刷新页面）">⟳</button>
       </div>
-      <input type="file" data-el="file" accept=".md,.markdown,.txt,.json,text/markdown,application/json" hidden>
+      <input type="file" data-el="file" accept=".md,.markdown,.txt,.json,.csv,text/markdown,application/json,text/csv" hidden>
       <input type="file" data-el="folder" webkitdirectory directory multiple hidden>
     </div>
 
@@ -555,7 +555,7 @@ export function createStoryboardPanel(root, app) {
       <summary>怎么用（三步）</summary>
       <div class="sb-box-body">
         <ol>
-          <li><b>导入分镜</b>：点右上角「导入分镜」选 .md，或把文件拖进来；豆包导演导出的提示词包选 <b>08-分镜表.json</b> 也能直接导入。</li>
+          <li><b>导入分镜</b>：点右上角「导入分镜」选 .md，或把文件拖进来；豆包提示词包优先选 <b>08-分镜表.json</b>，也可以选 <b>06-镜头表.csv</b> 或 <b>04-视频提示词.txt</b>。</li>
           <li><b>导入素材库</b>：点「素材库」选母库文件夹；文件名里带 S-01 / R-01 / S02-U01 的会自动对上。</li>
           <li><b>打开工作流</b>：在 ComfyUI 里打开你要用的图生视频工作流（面板顶部变绿就说明认到了）。</li>
           <li><b>按顺序做</b>：点下面的「应用下一镜」，素材会自动上传并填好，再回 ComfyUI 点「运行」；出完 4 条再回来点下一镜。</li>
@@ -563,12 +563,12 @@ export function createStoryboardPanel(root, app) {
         <div class="sb-hint">看不懂参数没关系，全部已经按手册的 A／B／C 档算好，按钮会自动填进工作流。</div>
         <div class="sb-hint">注意：合成好的首帧图，文件名带上镜号（如 S02-U01.png）会被优先当作这一镜的首帧。</div>
         <div class="sb-hint">格式很宽松：标题 # 可省略、竖线 ｜ 或 / 都行、S02U01 也认；只要出现镜号就能拆出镜头。</div>
-        <div class="sb-hint">提示词包 JSON：按 shots 逐镜成卡，视频提示词末尾的 Negative 段会自动拆出来单独显示。</div>
+        <div class="sb-hint">提示词包：08 JSON 字段最全；06 CSV 按 12 列表头对列；04 TXT 只带时长/机位与英文提示词。视频提示词末尾的 Negative 段会自动拆出来单独显示。</div>
       </div>
     </details>
 
     <div class="sb-paste" data-el="paste" hidden>
-      <textarea data-el="text" spellcheck="false" placeholder="粘贴分镜执行卡（Markdown）或提示词包 JSON（08-分镜表.json）"></textarea>
+      <textarea data-el="text" spellcheck="false" placeholder="粘贴分镜执行卡（Markdown），或提示词包 JSON / CSV / 04-视频提示词.txt"></textarea>
       <div class="sb-paste-actions">
         <button class="sb-btn primary" data-el="parse">解析</button>
         <button class="sb-btn" data-el="clear">清空</button>
@@ -3679,6 +3679,12 @@ export function createStoryboardPanel(root, app) {
     }
     state.raw = text;
     state.doc = parseAnyStoryboard(text);
+    // 提示词包自带全局负向（对应 05-负向提示词.txt），直接采用；是否写进节点仍看「同步负向」开关
+    if (state.doc.negativePrompt && state.doc.negativePrompt !== settings().negative) {
+      settings().negative = state.doc.negativePrompt;
+      if (el.negative) el.negative.value = settings().negative;
+      logLine("已采用提示词包的全局负向提示词", "ok");
+    }
     state.applied = {};
     // 新一批：上一批的输出视频与衔接帧不再适用，留着会接错片
     state.shots = {};

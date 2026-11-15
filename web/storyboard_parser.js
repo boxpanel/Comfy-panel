@@ -606,15 +606,32 @@ function splitInlineNegative(value) {
 }
 
 /**
+ * 时长字符串 → 秒数。导演包里有三种写法：`5s`、`5 秒`、`3—8 秒`；
+ * 区间取上限（与交付卡总时长口径一致），带「分」的先折成秒。
+ */
+export function durationSeconds(value) {
+  const text = String(value || "").replace(/[，,]/g, " ").trim();
+  if (!text) return 0;
+  const minutes = text.match(/(\d+(?:\.\d+)?)\s*分/);
+  if (minutes) {
+    const seconds = text.match(/(\d+(?:\.\d+)?)\s*秒/);
+    return Number(minutes[1]) * 60 + (seconds ? Number(seconds[1]) : 0);
+  }
+  const numbers = text.match(/\d+(?:\.\d+)?/g);
+  if (!numbers || !numbers.length) return 0;
+  return Math.max(...numbers.map(Number));
+}
+
+/**
  * 解析「提示词包」JSON（豆包导演导出的 08-分镜表.json）：
  * { title, summary, negativePrompt, shots: [{ shot, duration, subject, environment,
  *   camera, elapsed, anchor, scene, firstFrame, lastFrame, videoPrompt, audio,
  *   continuity, acceptance, risk }] }
  * 每镜映射成一张卡：视频提示词 → 英文提示词，其余中文字段合成中文提示词。
  */
-export function parsePromptPack(data) {
+export function parsePromptPack(data, titleOverride) {
   const pack = data && typeof data === "object" ? data : {};
-  const title = String(pack.title || "提示词包").trim();
+  const title = String(titleOverride || pack.title || "提示词包").trim();
   const tiers = cloneTierDefaults();
   const scene = { no: 1, name: title, units: [], note: String(pack.summary || "").trim() };
   const units = [];
@@ -633,7 +650,7 @@ export function parsePromptPack(data) {
       label: no,
       sceneName: title,
       durationText,
-      duration: parseFloat(durationText) || 0,
+      duration: durationSeconds(durationText),
       shot: "",
       camera: String((shot && shot.camera) || "").trim(),
       assets: extractAssets(
@@ -665,20 +682,129 @@ export function parsePromptPack(data) {
   });
 
   if (!units.length) warnings.push("JSON 里没有 shots 镜头列表");
-  return { title, scenes: [scene], units, params: tiers, tierMap: {}, warnings, source: "pack" };
+  return {
+    title,
+    scenes: [scene],
+    units,
+    params: tiers,
+    tierMap: {},
+    warnings,
+    negativePrompt: String(pack.negativePrompt || "").trim(),
+    source: "pack",
+  };
 }
 
-/** 统一入口：JSON 提示词包走 parsePromptPack，其余仍按 Markdown 执行卡解析 */
-export function parseAnyStoryboard(text) {
+/** 极简 CSV：支持引号包裹、字段内逗号换行、"" 转义、UTF-8 BOM */
+function parseCsvRows(text) {
+  const source = String(text || "").replace(/^\uFEFF/, "");
+  const rows = [];
+  let row = [];
+  let field = "";
+  let quoted = false;
+  for (let i = 0; i < source.length; i += 1) {
+    const char = source[i];
+    if (quoted) {
+      if (char === '"') {
+        if (source[i + 1] === '"') {
+          field += '"';
+          i += 1;
+        } else {
+          quoted = false;
+        }
+      } else {
+        field += char;
+      }
+      continue;
+    }
+    if (char === '"') {
+      quoted = true;
+    } else if (char === ",") {
+      row.push(field);
+      field = "";
+    } else if (char === "\n") {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else if (char !== "\r") {
+      field += char;
+    }
+  }
+  if (field || row.length) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows.filter((cells) => cells.some((cell) => String(cell).trim()));
+}
+
+// 06-镜头表.csv 固定 12 列
+const CSV_FIELD_MAP = {
+  镜头号: "shot",
+  时长: "duration",
+  主体状态: "subject",
+  环境与光照: "environment",
+  机位与运镜: "camera",
+  时间流逝: "elapsed",
+  空间锚点: "anchor",
+  首帧提示词: "firstFrame",
+  尾帧提示词: "lastFrame",
+  视频提示词: "videoPrompt",
+  首尾帧验收: "acceptance",
+  风险: "risk",
+};
+
+/** 备用解析：06-镜头表.csv（按表头对列，表头缺失时按固定顺序兜底） */
+export function parsePromptPackCsv(text, titleOverride) {
+  const rows = parseCsvRows(text);
+  if (!rows.length) return parsePromptPack({ title: "", shots: [] }, titleOverride);
+  const header = rows[0].map((cell) => String(cell).trim());
+  const keys = header.map((name, index) => CSV_FIELD_MAP[name] || Object.values(CSV_FIELD_MAP)[index] || null);
+  const shots = rows.slice(1).map((cells) => {
+    const shot = {};
+    cells.forEach((cell, index) => {
+      const key = keys[index];
+      if (key) shot[key] = String(cell || "").trim();
+    });
+    return shot;
+  });
+  return parsePromptPack({ title: "", shots }, titleOverride);
+}
+
+/** 04-视频提示词.txt：【镜头 01】时长 / 景别·运镜，下一行起是英文提示词 */
+export function parsePromptPackTxt(text, titleOverride) {
+  const source = String(text || "").replace(/^\uFEFF/, "");
+  const pattern = /【镜头\s*(\d+)】([^\n]*)\n([\s\S]*?)(?=【镜头\s*\d+】|$)/g;
+  const shots = [];
+  let match;
+  while ((match = pattern.exec(source))) {
+    const [, no, head, body] = match;
+    const [duration, ...cameraParts] = String(head).split("/");
+    shots.push({
+      shot: no,
+      duration: String(duration || "").trim(),
+      camera: cameraParts.join("/").trim(),
+      videoPrompt: String(body || "").trim(),
+    });
+  }
+  return parsePromptPack({ title: "", shots }, titleOverride);
+}
+
+/** 统一入口：JSON / CSV / 04 纯文本 走提示词包解析，其余仍按 Markdown 执行卡解析 */
+export function parseAnyStoryboard(text, titleOverride) {
   const trimmed = String(text || "").trim();
+  if (!trimmed) return parseStoryboard(text);
   if (trimmed.startsWith("{")) {
     try {
       const data = JSON.parse(trimmed);
-      if (data && Array.isArray(data.shots) && data.shots.length) return parsePromptPack(data);
+      if (data && Array.isArray(data.shots) && data.shots.length) {
+        return parsePromptPack(data, titleOverride);
+      }
     } catch (error) {
       /* 不是合法 JSON 就退回 Markdown 解析 */
     }
   }
+  if (/【镜头\s*\d+】/.test(trimmed)) return parsePromptPackTxt(trimmed, titleOverride);
+  if (/^\uFEFF?"?镜头号"?\s*,/.test(trimmed)) return parsePromptPackCsv(trimmed, titleOverride);
   return parseStoryboard(text);
 }
 
