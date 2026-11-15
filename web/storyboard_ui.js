@@ -9,6 +9,7 @@ import {
   extractAssetCodes,
   extractUnitIds,
   parseAnyStoryboard,
+  parseAssetNames,
   parseFrameName,
   parseStoryboard,
   summarize,
@@ -69,7 +70,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
-const PANEL_VERSION = `v53.20 · 接点 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.21 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -549,7 +550,7 @@ export function createStoryboardPanel(root, app) {
         <button class="sb-btn" data-el="paste-toggle">粘贴</button>
         <button class="sb-btn" data-el="update" title="检查并更新插件（git pull，更新后刷新页面）">⟳</button>
       </div>
-      <input type="file" data-el="file" accept=".md,.markdown,.txt,.json,.csv,text/markdown,application/json,text/csv" hidden>
+      <input type="file" data-el="file" accept=".md,.markdown,.txt,.json,.csv,text/markdown,application/json,text/csv" multiple hidden>
       <input type="file" data-el="folder" webkitdirectory directory multiple hidden>
     </div>
 
@@ -564,7 +565,7 @@ export function createStoryboardPanel(root, app) {
       <summary>怎么用（三步）</summary>
       <div class="sb-box-body">
         <ol>
-          <li><b>导入分镜</b>：点右上角「导入分镜」选 .md，或把文件拖进来；豆包提示词包优先选 <b>08-分镜表.json</b>，也可以选 <b>06-镜头表.csv</b> 或 <b>04-视频提示词.txt</b>。</li>
+          <li><b>导入分镜</b>：点右上角「导入分镜」选 .md，或把文件拖进来；豆包提示词包优先选 <b>08-分镜表.json</b>，也可以一次多选 08 / 06 / 04（连同 03 素材表），镜数不一致时以 08 为准。</li>
           <li><b>导入素材库</b>：点「素材库」选母库文件夹；文件名里带 S-01 / R-01 / S02-U01 的会自动对上。</li>
           <li><b>打开工作流</b>：在 ComfyUI 里打开你要用的图生视频工作流（面板顶部变绿就说明认到了）。</li>
           <li><b>按顺序做</b>：点下面的「应用下一镜」，素材会自动上传并填好，再回 ComfyUI 点「运行」；出完 4 条再回来点下一镜。</li>
@@ -3771,8 +3772,12 @@ export function createStoryboardPanel(root, app) {
     if (!stats.total) {
       toast("已读入文件，但没找到镜号标题：看列表里的格式说明", "err");
     } else {
-      // 导演口径：每卡都要有「保留」行，漏了等于把服装/道具交给模型自由发挥
-      const missing = state.doc.units.filter((unit) => !String(unit.retention || "").trim());
+      // 导演口径：每卡都要有「保留」行，漏了等于把服装/道具交给模型自由发挥。
+      // 提示词包没有这一行（用主体当连续性约束），只在 Markdown 手册里检查。
+      const missing =
+        state.doc.source === "pack"
+          ? []
+          : state.doc.units.filter((unit) => !String(unit.retention || "").trim());
       const tail = missing.length
         ? `；${missing.length} 镜缺「保留」：${missing.slice(0, 5).map((unit) => unit.id).join("、")}${missing.length > 5 ? "…" : ""}`
         : "";
@@ -3805,6 +3810,91 @@ export function createStoryboardPanel(root, app) {
     }
   }
 
+  // 提示词包里的三类镜表 + 两张附表，按内容认，不靠文件名
+  const PACK_KIND_LABEL = { json: "08 JSON", csv: "06 CSV", txt: "04 TXT", shots: "01 分镜", assets: "03 素材", frames: "02 首尾帧" };
+
+  function packKindOf(name, text) {
+    const lower = String(name || "").toLowerCase();
+    const head = String(text || "").slice(0, 6000);
+    if (/\.json$/i.test(lower) || /^\uFEFF?\s*\{/.test(head)) return "json";
+    if (/\.csv$/i.test(lower) || (/镜头号/.test(head.split(/\r?\n/, 1)[0] || "") && head.includes(","))) return "csv";
+    if (/\.txt$/i.test(lower) || /【镜头\s*\d+】/.test(head)) return "txt";
+    if (/素材提示词|素材清单/.test(head) || /^###\s*(?:ST|S|C|P|E|R|T|G)-\d{2}\s*[·・]/m.test(head)) return "assets";
+    if (/首帧提示词\s*[（(]/.test(head)) return "frames";
+    if (/镜头\s*\d+/.test(head)) return "shots";
+    return "";
+  }
+
+  /** 多选导入：以 08 JSON 为主源，其余文件只做镜数核对 / 素材名称补全 */
+  async function importFiles(fileList) {
+    const files = Array.from(fileList || []).filter(
+      (file) => file && file.name && !file.name.startsWith(".") && !/\.(docx?|pdf|pptx?|xlsx?)$/i.test(file.name)
+    );
+    if (!files.length) return;
+    if (files.length === 1) return importFile(files[0]);
+
+    const entries = [];
+    for (const file of files) {
+      if (file.size > 4 * 1024 * 1024) {
+        logLine(`跳过 ${file.name}：超过 4MB`, "warn");
+        continue;
+      }
+      try {
+        entries.push({ file, text: await file.text() });
+      } catch (error) {
+        logLine(`读取 ${file.name} 失败：${error.message}`, "err");
+      }
+    }
+    entries.forEach((entry) => {
+      entry.kind = packKindOf(entry.file.name, entry.text);
+    });
+
+    const primaryOrder = ["json", "csv", "txt", "shots"];
+    const primary = primaryOrder.map((kind) => entries.find((entry) => entry.kind === kind)).find(Boolean);
+    const main = primary || entries[0];
+    if (!main) return;
+    importRaw(main.text, main.file.name);
+
+    // 同一份包的几份镜表：镜数不一致就以主源为准，并在日志里说清楚
+    const counts = primaryOrder
+      .map((kind) => {
+        const entry = entries.find((item) => item.kind === kind);
+        if (!entry) return null;
+        try {
+          return { kind, total: parseAnyStoryboard(entry.text).units.length, name: entry.file.name };
+        } catch (error) {
+          return null;
+        }
+      })
+      .filter(Boolean);
+    if (counts.length > 1) {
+      const label = counts.map((item) => `${PACK_KIND_LABEL[item.kind]} ${item.total} 镜`).join(" / ");
+      const primaryCount = counts.find((item) => item.kind === main.kind);
+      const differ = primaryCount && counts.some((item) => item.total !== primaryCount.total);
+      if (differ) {
+        logLine(`同一份包镜数不一致：${label}；已按 ${PACK_KIND_LABEL[main.kind]} 导入，其余仅作核对`, "warn");
+      } else {
+        logLine(`同一份包镜数一致：${label}`, "ok");
+      }
+    }
+
+    // 03 素材表：补「编号 → 类型·名称」，08 自带 assets 时以 08 为准
+    const assetEntry = entries.find((entry) => entry.kind === "assets");
+    if (assetEntry && state.doc) {
+      const names = parseAssetNames(assetEntry.text);
+      const existing = state.doc.assetNames || {};
+      const added = Object.keys(names).filter((code) => !existing[code]);
+      if (Object.keys(names).length) {
+        state.doc.assetNames = { ...names, ...existing };
+        logLine(`已从 03 素材表读入 ${Object.keys(names).length} 条名称（新增 ${added.length} 条）`, "ok");
+        renderList();
+      }
+    }
+    if (entries.some((entry) => entry.kind === "frames")) {
+      logLine("02 首尾帧表暂不单独导入（首尾帧已随 08 / 01 进卡）", "info");
+    }
+  }
+
   // ---------- 事件绑定 ----------
 
   el.pick.addEventListener("click", () => el.file.click());
@@ -3818,9 +3908,9 @@ export function createStoryboardPanel(root, app) {
   });
 
   el.file.addEventListener("change", () => {
-    const file = el.file.files && el.file.files[0];
+    const files = Array.from(el.file.files || []);
     el.file.value = "";
-    importFile(file);
+    importFiles(files).catch((error) => toast("读取文件失败：" + error.message, "err"));
   });
 
   el["paste-toggle"].addEventListener("click", () => {
@@ -4307,8 +4397,8 @@ export function createStoryboardPanel(root, app) {
     event.stopPropagation();
     dragDepth = 0;
     root.classList.remove("dragging");
-    const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
-    if (file) importFile(file);
+    const files = event.dataTransfer ? Array.from(event.dataTransfer.files || []) : [];
+    if (files.length) importFiles(files).catch((error) => toast("读取文件失败：" + error.message, "err"));
   });
 
   el.guide.open = !state.doc;
