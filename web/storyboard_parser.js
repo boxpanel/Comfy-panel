@@ -768,6 +768,8 @@ export function parsePromptPack(data, titleOverride) {
   const scene = { no: 1, name: title, units: [], note: String(pack.summary || "").trim() };
   const units = [];
   const warnings = [];
+  // 出包端若已汇总「缺视频提示词」的镜号，逐镜重复的那句就不刷屏了
+  const emptyPromptWarnings = [];
 
   (Array.isArray(pack.shots) ? pack.shots : []).forEach((shot, index) => {
     const no = String(shot && shot.shot != null ? shot.shot : index + 1).padStart(2, "0");
@@ -848,7 +850,9 @@ export function parsePromptPack(data, titleOverride) {
     const mostlyEnglish = unit.promptEn.length > 0 && cjkCount / unit.promptEn.length < 0.2;
     const tail = unit.promptEn.trim().slice(-1);
     if (!unit.promptEn) {
-      warnings.push(`${unit.id} 视频提示词为空，这一镜在包里被截断了`);
+      const text = `${unit.id} 视频提示词为空，这一镜在包里被截断了`;
+      warnings.push(text);
+      emptyPromptWarnings.push(text);
     } else if (dangling) {
       warnings.push(`${unit.id} 有字段以冒号/逗号结尾，疑似被截断：…${unit.promptEn.slice(-24)}`);
     } else if (openParen !== closeParen) {
@@ -863,6 +867,14 @@ export function parsePromptPack(data, titleOverride) {
     .map((item) => String(item || "").trim())
     .filter(Boolean);
   warnings.push(...packWarnings);
+  // 出包端已经列出了缺提示词的镜号，逐镜那 6 句就不再重复刷日志
+  const packListsMissing = packWarnings.some((item) => /缺视频提示词|缺首帧|视频提示词或首帧/.test(item));
+  if (packListsMissing) {
+    emptyPromptWarnings.forEach((text) => {
+      const at = warnings.indexOf(text);
+      if (at >= 0) warnings.splice(at, 1);
+    });
+  }
 
   if (!units.length) warnings.push("JSON 里没有 shots 镜头列表");
   // 导演规律：每场第一个镜头一律硬切
