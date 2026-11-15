@@ -197,6 +197,9 @@ export function parseTierParams(lines) {
 function soundscapeOf(value) {
   let text = String(value || "").trim();
   if (!text || /^无[。；;]?$/.test(text)) return "";
+  // 「无（火盆炭火轻微噼啪）」= 没台词，只有这一段环境声，括号里才是音效
+  const onlyFx = text.match(/^无(?:对白)?\s*[（(]([\s\S]*)[）)]\s*$/);
+  if (onlyFx) text = onlyFx[1].trim();
   text = text.replace(/^无对白\s*[。；;，,、]?\s*/g, "").replace(/^有对白\s*[：:]\s*/g, "");
   const DROP = /只借|音色参考|不复制参考|不复制原句|物理声独立生成|不用参考音频/;
   // 「说话人（情绪）：台词」是台词，不是音效；但「音效：」「环境声：」要留着
@@ -208,17 +211,25 @@ function soundscapeOf(value) {
   const sentences = text
     .split("。")
     .map((sentence) => sentence.trim())
-    .filter((sentence) => sentence && !DROP.test(sentence) && !isDialogue(sentence));
+    .filter(
+      (sentence) =>
+        sentence &&
+        !DROP.test(sentence) &&
+        !isDialogue(sentence) &&
+        // 只剩引号、括号的碎片（「…。」被句号切开后会留下一片「」）不算音效
+        /[\u4e00-\u9fffa-zA-Z0-9]/.test(sentence)
+    );
   let out = sentences.join("。");
   // 有「音效：」就只取这一段，说话人、台词和起说/说完的时间都不进提示词
   const fx = out.match(/音效\s*[：:]\s*([\s\S]*)$/);
   if (fx) {
     out = fx[1];
   } else if (out.includes("「")) {
-    // 没有音效段时兜底：引号里的台词和它后面的时间说明都去掉
-    out = out.replace(/「[^」]*」[^。]*/g, "");
+    // 没有「音效：」段时兜底：只去掉引号里的台词，引号外的动作声保留
+    // （新包里「雪杖绷紧「格」声、芳子急喘」这种引号是拟声，不能整句删掉）
+    out = out.replace(/「[^」]*」/g, "");
   }
-  return out.replace(/^[。；;，,\s]+/, "").replace(/\s+/g, " ").trim();
+  return out.replace(/[「」]/g, "").replace(/^[。；;，,、\s]+/, "").replace(/[，,、\s]+$/, "").replace(/\s+/g, " ").trim();
 }
 
 /**
