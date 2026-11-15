@@ -594,6 +594,16 @@ export function parseStoryboard(rawText) {
   return result;
 }
 
+/** 接点：连续 cont / 切换 cut / 硬切 hard；缺字段或看不懂一律 unknown */
+export function normalizeJoint(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) return "unknown";
+  if (/hard|硬切/.test(text)) return "hard";
+  if (/cut|切换/.test(text)) return "cut";
+  if (/cont|连续/.test(text)) return "cont";
+  return "unknown";
+}
+
 /** 把视频提示词末尾内嵌的「Negative: …」拆出来，避免和负向提示词重复 */
 function splitInlineNegative(value) {
   const text = String(value || "").trim();
@@ -681,6 +691,9 @@ export function parsePromptPack(data, titleOverride) {
       risk: String((shot && shot.risk) || "").trim(),
       firstFramePrompt: String((shot && shot.firstFrame) || "").trim(),
       lastFramePrompt: String((shot && shot.lastFrame) || "").trim(),
+      // 接点：决定这镜要不要沿用上一镜画面
+      joint: normalizeJoint(shot && shot.joint),
+      jointReference: String((shot && shot.jointReference) || "").trim(),
       tier: "B",
       params,
     };
@@ -695,6 +708,10 @@ export function parsePromptPack(data, titleOverride) {
   });
 
   if (!units.length) warnings.push("JSON 里没有 shots 镜头列表");
+  // 导演规则：每场第一个镜头一律硬切
+  if (units.length && units[0].joint === "unknown") {
+    warnings.push(`${units[0].id} 未标注接点；每场第一个镜头应为硬切`);
+  }
   return {
     title,
     scenes: [scene],
@@ -750,7 +767,7 @@ function parseCsvRows(text) {
   return rows.filter((cells) => cells.some((cell) => String(cell).trim()));
 }
 
-// 06-镜头表.csv 固定 12 列
+// 06-镜头表.csv：12 列基础版 + 新增的接点 / 音频对白
 const CSV_FIELD_MAP = {
   镜头号: "shot",
   时长: "duration",
@@ -764,6 +781,11 @@ const CSV_FIELD_MAP = {
   视频提示词: "videoPrompt",
   首尾帧验收: "acceptance",
   风险: "risk",
+  接点: "joint",
+  "音频/对白": "audio",
+  音频对白: "audio",
+  音频: "audio",
+  对白: "audio",
 };
 
 /** 备用解析：06-镜头表.csv（按表头对列，表头缺失时按固定顺序兜底） */
@@ -783,22 +805,37 @@ export function parsePromptPackCsv(text, titleOverride) {
   return parsePromptPack({ title: "", shots }, titleOverride);
 }
 
-/** 04-视频提示词.txt：【镜头 01】时长 / 景别·运镜，下一行起是英文提示词 */
+/** 04-视频提示词.txt：可选的「接点：连续」行 + 【镜头 01】时长 / 景别·运镜 + 下一行起英文提示词 */
 export function parsePromptPackTxt(text, titleOverride) {
   const source = String(text || "").replace(/^\uFEFF/, "");
-  const pattern = /【镜头\s*(\d+)】([^\n]*)\n([\s\S]*?)(?=【镜头\s*\d+】|$)/g;
   const shots = [];
-  let match;
-  while ((match = pattern.exec(source))) {
-    const [, no, head, body] = match;
-    const [duration, ...cameraParts] = String(head).split("/");
-    shots.push({
-      shot: no,
-      duration: String(duration || "").trim(),
-      camera: cameraParts.join("/").trim(),
-      videoPrompt: String(body || "").trim(),
-    });
+  let current = null;
+  let pendingJoint = "";
+  for (const line of source.split(/\r?\n/)) {
+    const jointMatch = line.match(/^接点\s*[：:]\s*(.*)$/);
+    if (jointMatch) {
+      // 接点行写在本镜的【镜头】标题之前，属于下一镜
+      pendingJoint = jointMatch[1].trim();
+      continue;
+    }
+    const head = line.match(/^【镜头\s*(\d+)】\s*(.*)$/);
+    if (head) {
+      const [duration, ...cameraParts] = String(head[2] || "").split("/");
+      current = {
+        shot: head[1],
+        duration: duration.trim(),
+        camera: cameraParts.join("/").trim(),
+        videoPrompt: "",
+        joint: pendingJoint,
+        jointReference: pendingJoint,
+      };
+      pendingJoint = "";
+      shots.push(current);
+      continue;
+    }
+    if (current) current.videoPrompt = `${current.videoPrompt ? `${current.videoPrompt}\n` : ""}${line}`;
   }
+  for (const shot of shots) shot.videoPrompt = String(shot.videoPrompt || "").trim();
   return parsePromptPack({ title: "", shots }, titleOverride);
 }
 

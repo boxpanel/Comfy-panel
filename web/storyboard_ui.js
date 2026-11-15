@@ -69,7 +69,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
-const PANEL_VERSION = `v53.17 · 包自动填参 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.18 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -259,6 +259,14 @@ const CSS = `
 }
 .sb-fight.on{border-color:#f97316;color:#fb923c;background:rgba(249,115,22,.14);font-weight:600;}
 .sb-fight:hover{border-color:var(--sb-accent);}
+.sb-joint{
+  font-size:9.5px;padding:1px 5px;border-radius:9px;white-space:nowrap;cursor:default;
+  border:1px solid var(--sb-line);color:var(--sb-muted);background:transparent;
+}
+.sb-joint.cont{border-color:#22c55e;color:#4ade80;}
+.sb-joint.cut{border-color:#60a5fa;color:#93c5fd;}
+.sb-joint.hard{border-color:#ef4444;color:#f87171;}
+.sb-joint.unknown{border-color:#f59e0b;color:#fbbf24;}
 .sb-zh{font-size:11.5px;line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
 .sb-en{font-size:10.5px;line-height:1.45;color:var(--sb-muted);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;}
 .sb-zh.open,.sb-en.open{display:block;-webkit-line-clamp:unset;}
@@ -1509,10 +1517,27 @@ export function createStoryboardPanel(root, app) {
       );
     }
     // 跨镜衔接：上一镜视频接在 ref_videos.ref_video_0
+    const joint = unitJoint(unit);
     if (video) {
+      if (joint === "cut") {
+        lines.push(
+          "",
+          `<Video 1> is the previous shot ${video.unitId}: use it only for the identity of the characters, their wardrobe and the light source; composition, camera angle and space are rebuilt for this shot.`
+        );
+      } else {
+        // 连续 / 未标注：把上一镜的结束状态也写进去，方便接动作
+        const ending = String(unit.jointReference || unit.continuity || "").trim();
+        const asciiEnding = ending && !/[\u4e00-\u9fff]/.test(ending) ? ` Previous shot ends with: ${ending}` : "";
+        lines.push(
+          "",
+          `<Video 1> is the previous shot ${video.unitId}: keep the same characters, wardrobe, props, set dressing, light direction and colour grade. Use it only as a continuity reference; this shot's framing, camera angle and action are defined above.${asciiEnding}`
+        );
+      }
+    }
+    if (joint === "hard") {
       lines.push(
         "",
-        `<Video 1> is the previous shot ${video.unitId}: keep the same characters, wardrobe, props, set dressing, light direction and colour grade. Use it only as a continuity reference; this shot's framing, camera angle and action are defined above.`
+        "Do not carry over any frame, composition or lighting layout from the previous shot; rebuild the space, blocking and light from the reference pictures only."
       );
     }
     // 原生 Ref2V 的参考音频按 ref_audios 顺序编号，提示词里要说清「只要音色」
@@ -1995,11 +2020,27 @@ export function createStoryboardPanel(root, app) {
 
   /** 本镜手动从上一镜末帧取的图（卡片上的「取上一镜末帧」） */
   function continuityPick(unit) {
+    // 硬切禁止沿用上一镜画面，连末帧也不接
+    if (unitJoint(unit) === "hard") return null;
     const saved = state.continuity[unit.id];
     if (!saved || !saved.name) return null;
     const entry = libraryStore.files.find((item) => item.name === saved.name);
     if (!entry) return null;
     return { code: saved.from || "", entry, continuity: true, cropped: !!saved.cropped };
+  }
+
+  // 接点：连续（可参考上一镜）/ 切换（只借身份）/ 硬切（完全重锚）/ 未标注
+  const JOINT_LABEL = { cont: "连续", cut: "切换", hard: "硬切", unknown: "未标注" };
+  const JOINT_HINT = {
+    cont: "可把上一镜尾帧当视频参考，机位按本镜重设",
+    cut: "上一镜只作人物 / 服装 / 光源身份参考，构图重设",
+    hard: "禁止沿用上一镜画面，改用素材参考图重新锚定",
+    unknown: "未标注接点：先按连续处理，请人工确认是否应改为硬切",
+  };
+
+  function unitJoint(unit) {
+    const kind = String((unit && unit.joint) || "").toLowerCase();
+    return Object.prototype.hasOwnProperty.call(JOINT_LABEL, kind) ? kind : "unknown";
   }
 
   /** 输出目录里的视频用 annotated 路径交给 VHS_LoadVideo */
@@ -2056,6 +2097,11 @@ export function createStoryboardPanel(root, app) {
   async function applyUnitVideo(unit) {
     lastVideoBound = null;
     if (!referenceVideoSlots(app).length) return { ok: true, message: "" };
+    // 硬切：不沿用上一镜任何画面，直接断开参考视频
+    if (unitJoint(unit) === "hard") {
+      const cleared = clearVideoSlotsFrom(app, 0);
+      return { ok: true, message: cleared ? "硬切：已断开上一镜参考视频" : "硬切：不接上一镜" };
+    }
     if (settings().continuityVideo === false) {
       const cleared = clearVideoSlotsFrom(app, 0);
       return { ok: true, message: cleared ? "已关闭跨镜接续，清空参考视频" : "" };
@@ -2734,6 +2780,7 @@ export function createStoryboardPanel(root, app) {
     const prevShot = prevUnit ? state.shots[prevUnit.id] : null;
     const cont = state.continuity[unit.id];
     const fight = unitFight(unit);
+    const joint = unitJoint(unit);
     const contLine = cont
       ? `<div class="sb-line"><b>衔接帧</b> ${escapeHtml(cont.name)}${cont.cropped ? "（局部）" : ""}${
           cont.from ? ` ← ${escapeHtml(cont.from)} 末帧` : ""
@@ -2758,6 +2805,7 @@ export function createStoryboardPanel(root, app) {
           <span class="sb-fight ${fight.on ? "on" : ""}" data-act="fight" title="武打 LoRA：${
             fight.on ? "开" : "关"
           }（${fight.manual ? "手动" : fight.autoOff ? "自动已关" : "按分镜自动"}），点击切换">武打${fight.manual ? "·手动" : ""}</span>
+          <span class="sb-joint ${joint}" title="接点：${JOINT_LABEL[joint]} · ${JOINT_HINT[joint]}">${JOINT_LABEL[joint]}</span>
           <span class="sb-check">${applied ? "✓" : ""}</span>
         </div>
         <div class="sb-zh ${expanded ? "open" : ""}">${escapeHtml(unit.promptZh || "（无中文提示词）")}</div>
@@ -2769,8 +2817,14 @@ export function createStoryboardPanel(root, app) {
             : ""
         }
         ${
-          unit.continuity && expanded
-            ? `<div class="sb-line"><b>接点</b> ${escapeHtml(unit.continuity)}</div>`
+          expanded
+            ? `<div class="sb-line"><b>接点</b> ${JOINT_LABEL[joint]} · ${JOINT_HINT[joint]}${
+                unit.jointReference
+                  ? `；${escapeHtml(unit.jointReference)}`
+                  : unit.continuity
+                    ? `；${escapeHtml(unit.continuity)}`
+                    : ""
+              }</div>`
             : ""
         }
         ${
