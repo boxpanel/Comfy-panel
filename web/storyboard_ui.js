@@ -12,7 +12,7 @@ import {
   parseFrameName,
   parseStoryboard,
   summarize,
-} from "./storyboard_parser.js?v=20261115a";
+} from "./storyboard_parser.js?v=20261115b";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -69,7 +69,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
-const PANEL_VERSION = `v53.19 · 接点 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.20 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -306,6 +306,7 @@ const CSS = `
   box-shadow:0 6px 18px rgba(0,0,0,.35);z-index:30;
 }
 .sb-toast.ok{border-color:#3fb950;}
+.sb-toast.warn{border-color:#d29922;}
 .sb-toast.err{border-color:#f85149;}
 .sb-modal{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.62);}
 .sb-modal-box{width:min(880px,96vw);max-height:92vh;display:flex;flex-direction:column;gap:8px;padding:10px;border-radius:8px;border:1px solid var(--sb-line);background:var(--sb-bg);color:var(--sb-fg);box-shadow:0 18px 48px rgba(0,0,0,.5);}
@@ -831,7 +832,7 @@ export function createStoryboardPanel(root, app) {
     toastTimer = setTimeout(() => {
       el.toast.hidden = true;
     }, 3200);
-    logLine(message, kind === "err" ? "err" : kind === "ok" ? "ok" : "info");
+    logLine(message, kind === "err" ? "err" : kind === "ok" ? "ok" : kind === "warn" ? "warn" : "info");
   }
 
   function settings() {
@@ -2035,8 +2036,17 @@ export function createStoryboardPanel(root, app) {
     cont: "可把上一镜尾帧当视频参考，机位按本镜重设",
     cut: "上一镜只作人物 / 服装 / 光源身份参考，构图重设",
     hard: "禁止沿用上一镜画面，改用素材参考图重新锚定",
-    unknown: "未标注接点：先按连续处理，请人工确认是否应改为硬切",
+    unknown: "未标注接点：先按连续处理，请补标接点类型",
   };
+
+  /** 接点说明行：提示词包给的整句已经带类型前缀，别重复拼一遍 */
+  function jointLine(unit, joint) {
+    const ref = String((unit && unit.jointReference) || "").trim();
+    const tail = ref
+      ? ref.replace(/^(?:硬切|切换|连续|未标注)(?:接点)?\s*[·・:：,，-]?\s*/, "")
+      : String((unit && unit.continuity) || "").trim();
+    return `${JOINT_LABEL[joint]} · ${tail || JOINT_HINT[joint]}`;
+  }
 
   function unitJoint(unit) {
     const kind = String((unit && unit.joint) || "").toLowerCase();
@@ -2818,13 +2828,7 @@ export function createStoryboardPanel(root, app) {
         }
         ${
           expanded
-            ? `<div class="sb-line"><b>接点</b> ${JOINT_LABEL[joint]} · ${JOINT_HINT[joint]}${
-                unit.jointReference
-                  ? `；${escapeHtml(unit.jointReference)}`
-                  : unit.continuity
-                    ? `；${escapeHtml(unit.continuity)}`
-                    : ""
-              }</div>`
+            ? `<div class="sb-line"><b>接点</b> ${escapeHtml(jointLine(unit, joint))}</div>`
             : ""
         }
         ${
@@ -3773,11 +3777,12 @@ export function createStoryboardPanel(root, app) {
         ? `；${missing.length} 镜缺「保留」：${missing.slice(0, 5).map((unit) => unit.id).join("、")}${missing.length > 5 ? "…" : ""}`
         : "";
       const warnings = Array.isArray(state.doc.warnings) ? state.doc.warnings : [];
+      // 交付自检不是导入失败：黄色的 warn，别用红色 err 吓人
       warnings.forEach((warning) => logLine(warning, "warn"));
       const warnTail = warnings.length ? `；${warnings[0]}` : "";
       toast(
         `已解析 ${stats.scenes} 场 / ${stats.total} 个单元${sourceName ? "：" + sourceName : ""}${tail}${warnTail}`,
-        missing.length || warnings.length ? "err" : "ok"
+        missing.length || warnings.length ? "warn" : "ok"
       );
     }
   }

@@ -62,7 +62,8 @@ const TIER_DEFAULTS = {
   },
 };
 
-const ASSET_RE = /\b(?:T-P\d{2}|T-\d{2}|[RCSPG]-\d{2}[a-zA-Z]?(?:-E\d)?)\b/g;
+// 素材编号：S 角色 / C 服装 / P 道具 / E 场景 / ST 风格，兼容旧的 R / T / G / T-P
+const ASSET_RE = /\b(?:ST|T-P|T|R|C|S|P|G|E)-\d{2}[a-zA-Z]?(?:-E\d)?\b/g;
 
 /** 统一素材编号大小写：s-04a -> S-04a，t-p01 -> T-P01 */
 export function normalizeAssetCode(code) {
@@ -201,7 +202,9 @@ function soundscapeOf(value) {
   // 「说话人（情绪）：台词」是台词，不是音效；但「音效：」「环境声：」要留着
   const isDialogue = (sentence) =>
     !/^(?:音效|环境声|环境音)/.test(sentence) &&
-    /^[^：:。；]{1,12}(?:（[^）]{0,10}）)?\s*[：:]/.test(sentence);
+    (/^[^：:。；]{1,12}(?:（[^）]{0,10}）)?\s*[：:]/.test(sentence) ||
+      // 被截断的台词只剩「说话人（」也要认出来
+      /^[^：:。；]{1,10}（[^）]*$/.test(sentence));
   const sentences = text
     .split("。")
     .map((sentence) => sentence.trim())
@@ -234,7 +237,19 @@ function stripDialogueFromPrompt(value) {
   // 兜底：残留的音频槽位与引号台词
   text = text.replace(/<Audio\s*\d+>/gi, "");
   text = text.replace(/「[^」]*」/g, "");
-  return text.replace(/\s{2,}/g, " ").replace(/^[。；;，,\s]+/, "").trim();
+  // 合并后的提示词可能带换行，画面句之间用空格接起来
+  return text
+    .replace(/\s*\n+\s*/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .replace(/^[。；;，,\s]+/, "")
+    .replace(/[，,、；;：:\s]+$/, "")
+    .trim();
+}
+
+/** 从 <d>[Chinese] …</d> 里取出台词本身，供「对白」栏使用 */
+function spokenOf(value) {
+  const match = String(value || "").match(/<d>\s*(?:\[[^\]]*\])?\s*([\s\S]*?)<\/d>/i);
+  return match ? match[1].trim() : "";
 }
 
 /** 解析「场 2 的档位：U01、U04 用 A 档；……」 */
@@ -268,10 +283,43 @@ function fieldOf(key) {
   return null;
 }
 
+// 「镜头 NN」卡片（01-分镜提示词.md / 提示词包）的字段名，和 08 JSON 一一对应
+const SHOT_FIELD_MAP = {
+  时长: "durationText",
+  主体状态: "subject",
+  环境与光照: "environment",
+  机位与运镜: "camera",
+  时间流逝: "elapsed",
+  空间锚点: "anchor",
+  首帧提示词: "firstFramePrompt",
+  尾帧提示词: "lastFramePrompt",
+  视频提示词: "promptEn",
+  视频提示词补充: "dialogueText",
+  "音频/对白": "audio",
+  音频: "audio",
+  对白: "audio",
+  衔接: "continuity",
+  接点: "joint",
+  首尾帧验收: "acceptance",
+  风险: "risk",
+};
+
+function shotFieldOf(key) {
+  return SHOT_FIELD_MAP[key] || fieldOf(key);
+}
+
 /** 宽容地识别执行卡标题：S02-U01 / S02U01 / **S02-U01**｜8 秒｜大全｜固定机位 */
 function parseUnitHeading(rawLine) {
   let text = rawLine.trim().replace(/^(?:镜号|镜头|分镜)\s*[：:]\s*/i, "");
   if (!text || /^\|/.test(text)) return null;
+
+  // 兜底：「镜头 17」「### 镜头 26」这种只有镜号的标题，分镜提示词包用得多
+  const shotMatch = text.match(/^#{0,4}\s*镜头\s*(\d{1,3})\s*$/);
+  if (shotMatch) {
+    const label = String(Number(shotMatch[1])).padStart(2, "0");
+    return { sceneNo: 1, label, id: `S01-U${label}`, parts: [], tier: "", shotStyle: true };
+  }
+
   if (!/S\d{1,2}\s*[-_－—]?\s*U\d+[a-zA-Z]?/i.test(text)) return null;
 
   const headingLike =
@@ -389,7 +437,7 @@ function extractAssets(text) {
   return found;
 }
 
-const ASSET_CODE_PATTERN = "T-P\\d{2}|T-\\d{2}|[RCSPG]-\\d{2}[a-zA-Z]?(?:-E\\d)?";
+const ASSET_CODE_PATTERN = "(?:ST|T-P|T|R|C|S|P|G|E)-\\d{2}[a-zA-Z]?(?:-E\\d)?";
 
 /**
  * 从手册里抽「素材编号 → 中文名」对照表。
@@ -413,6 +461,14 @@ export function parseAssetNames(text) {
   let match;
   while ((match = rowRe.exec(text))) {
     put(match[1], match[2].split(/[（(]/)[0]);
+  }
+
+  // 新包标题：### S-01 · 角色 · 卫斯理 / ### E-02 · 场景 · 雪夜街道
+  const headingRe = new RegExp(`^#{1,6}\\s*(${ASSET_CODE_PATTERN})\\s*[·・|｜:：]?\\s*([^\\n]*)$`, "gm");
+  while ((match = headingRe.exec(text))) {
+    const parts = match[2].split(/[·・|｜]/).map((part) => part.trim()).filter(Boolean);
+    if (parts.length >= 2) put(match[1], `${parts[0]}·${parts[1]}`);
+    else if (parts.length === 1) put(match[1], parts[0]);
   }
 
   const listRe = /\*\*[^*]{0,8}：\*\*([^\n]+)/g;
@@ -528,6 +584,19 @@ export function parseStoryboard(rawText) {
         continuity: "",
         tier: heading.tier || "B",
         params: null,
+        firstFramePrompt: "",
+        lastFramePrompt: "",
+        negative: "",
+        acceptance: "",
+        risk: "",
+        joint: "",
+        jointReference: "",
+        subject: "",
+        environment: "",
+        elapsed: "",
+        anchor: "",
+        dialogueText: "",
+        _shotStyle: !!heading.shotStyle,
         _lastField: null,
         _tier: heading.tier || null,
       };
@@ -543,7 +612,7 @@ export function parseStoryboard(rawText) {
       if (bullet) {
         const key = unescapeMd(bullet[1]).trim();
         const value = unescapeMd(bullet[2]).trim();
-        const field = fieldOf(key);
+        const field = unit._shotStyle ? shotFieldOf(key) : fieldOf(key);
         if (field) {
           if (field === "assetsText") {
             // 「素材：S-01。｜保留：……」把保留项单独拆出来，供 retention_analysis 用
@@ -575,9 +644,45 @@ export function parseStoryboard(rawText) {
   }
 
   for (const unitData of result.units) {
-    unitData.assets = extractAssets(unitData.assetsText);
+    const shotStyle = !!unitData._shotStyle;
+    // 「镜头 NN」卡片没有「素材：」行，编号直接出现在主体/环境文本里
+    unitData.assets = extractAssets(
+      [unitData.assetsText, shotStyle ? unitData.subject : "", shotStyle ? unitData.environment : ""]
+        .filter(Boolean)
+        .join(" ")
+    );
     delete unitData.assetsText;
     delete unitData._lastField;
+    delete unitData._shotStyle;
+
+    if (shotStyle) {
+      unitData.duration = durationSeconds(unitData.durationText) || unitData.duration;
+      if (!unitData.promptZh) {
+        unitData.promptZh = [unitData.subject, unitData.environment, unitData.camera, unitData.elapsed, unitData.anchor]
+          .map((part) => String(part || "").trim().replace(/[。；;]+$/, ""))
+          .filter(Boolean)
+          .join("。");
+      }
+      if (!unitData.retention) {
+        unitData.retention = [unitData.subject, unitData.anchor].filter(Boolean).join("；");
+      }
+      // 台词只进「对白」栏：优先 音频/对白，其次 视频提示词补充 里的 <d>
+      const spoken = spokenOf(unitData.dialogueText);
+      if (!unitData.audio || /^无[。；;]?$/.test(unitData.audio)) {
+        unitData.audio = spoken;
+      } else if (spoken && !unitData.audio.includes(spoken)) {
+        unitData.audio = `${unitData.audio}；${spoken}`;
+      }
+      const rawJoint = String(unitData.joint || "").trim();
+      unitData.jointReference = rawJoint;
+      unitData.joint = normalizeJoint(rawJoint);
+      delete unitData.subject;
+      delete unitData.environment;
+      delete unitData.elapsed;
+      delete unitData.anchor;
+      delete unitData.dialogueText;
+    }
+
     unitData.soundscape = soundscapeOf(unitData.audio);
     // 台词与 <Audio N> 不写进画面 prompt（导演口径：台词只进音频栏）
     unitData.promptZh = stripDialogueFromPrompt(unitData.promptZh);
@@ -590,6 +695,13 @@ export function parseStoryboard(rawText) {
     delete unitData._tier;
     unitData.tier = tier;
     unitData.params = { ...result.params[tier] };
+    // 镜头卡的帧数按本镜时长算，和 08 JSON 导入保持一致
+    if (shotStyle && unitData.duration > 0) {
+      unitData.params.frames = Math.max(
+        5,
+        Math.round(unitData.duration * (Number(unitData.params.fps) || 16))
+      );
+    }
   }
 
   result.scenes.sort((a, b) => a.no - b.no);
@@ -662,9 +774,13 @@ export function parsePromptPack(data, titleOverride) {
     const rawVideo = String((shot && shot.videoPrompt) || "");
     const video = splitInlineNegative(rawVideo);
     // 带音频模型的包把台词写成 <d>[Chinese] …</d>；台词只进「对白」栏，不进画面
-    const spoken = String((rawVideo.match(/<d>\s*(?:\[[^\]]*\])?\s*([\s\S]*?)<\/d>/i) || [])[1] || "").trim();
+    const spoken = spokenOf(rawVideo);
     const audioText = String((shot && shot.audio) || "").trim();
     const audio = /^无[。；;]?$/.test(audioText) ? "" : audioText || spoken;
+    // 出包端按镜头文本里的素材名自动匹配出的编号，可能为空
+    const assetRefs = (Array.isArray(shot && shot.assetRefs) ? shot.assetRefs : [])
+      .map((code) => normalizeAssetCode(String(code || "").trim()))
+      .filter(Boolean);
     const durationText = String((shot && shot.duration) || "").trim();
     const seconds = durationSeconds(durationText);
     const zhParts = [shot.scene, shot.subject, shot.environment, shot.camera, shot.elapsed, shot.anchor]
@@ -689,9 +805,12 @@ export function parsePromptPack(data, titleOverride) {
       duration: seconds,
       shot: "",
       camera: String((shot && shot.camera) || "").trim(),
-      assets: extractAssets(
-        [shot.subject, shot.environment, shot.anchor, shot.scene, audio].filter(Boolean).join(" ")
-      ),
+      assets: [
+        ...new Set([
+          ...assetRefs,
+          ...extractAssets([shot.subject, shot.environment, shot.anchor, shot.scene, audio].filter(Boolean).join(" ")),
+        ]),
+      ],
       promptZh: zhParts.join("。"),
       promptEn: stripDialogueFromPrompt(video.text),
       // 提示词包的英文正文已经包含中文摘要的全部信息，拼提示词时不再重复中文
@@ -716,23 +835,34 @@ export function parsePromptPack(data, titleOverride) {
     scene.units.push(unit);
 
     // 导演工具偶尔会中途截断。中文成稿本来就不带句号，不能按句末标点判断；
-    // 只有英文成稿缺句末标点、字段括号没配上、或者整段为空，才算截断。
+    // 字段以冒号/逗号结尾、括号没配上、整段为空，或者英文成稿缺句末标点，才算截断。
     const joined = [shot.subject, shot.environment, shot.firstFrame, shot.lastFrame, unit.promptEn]
       .map((part) => String(part || ""))
       .join("|");
     const openParen = (joined.match(/（/g) || []).length;
     const closeParen = (joined.match(/）/g) || []).length;
+    const dangling = [shot.subject, shot.environment, shot.camera, shot.firstFrame, shot.lastFrame, rawVideo]
+      .map((part) => String(part || "").trim())
+      .some((part) => /[：:，,、]$/.test(part));
     const cjkCount = (unit.promptEn.match(/[\u4e00-\u9fff]/g) || []).length;
     const mostlyEnglish = unit.promptEn.length > 0 && cjkCount / unit.promptEn.length < 0.2;
     const tail = unit.promptEn.trim().slice(-1);
     if (!unit.promptEn) {
       warnings.push(`${unit.id} 视频提示词为空，这一镜在包里被截断了`);
+    } else if (dangling) {
+      warnings.push(`${unit.id} 有字段以冒号/逗号结尾，疑似被截断：…${unit.promptEn.slice(-24)}`);
     } else if (openParen !== closeParen) {
       warnings.push(`${unit.id} 字段括号没闭合，疑似被截断：…${unit.promptEn.slice(-24)}`);
     } else if (mostlyEnglish && !/[.!?。！？"')\]]/.test(tail)) {
       warnings.push(`${unit.id} 视频提示词疑似被截断：…${unit.promptEn.slice(-24)}`);
     }
   });
+
+  // 出包端的交付自检：非阻断，原样展示给使用者
+  const packWarnings = (Array.isArray(pack.warnings) ? pack.warnings : [])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  warnings.push(...packWarnings);
 
   if (!units.length) warnings.push("JSON 里没有 shots 镜头列表");
   // 导演规律：每场第一个镜头一律硬切
@@ -747,7 +877,36 @@ export function parsePromptPack(data, titleOverride) {
     if (value > cursor) gaps.push(`${cursor}-${value - 1}`);
     cursor = Math.max(cursor, value + 1);
   });
-  if (gaps.length) warnings.push(`镜头号不连续：缺 ${gaps.join("、")}（分场空号，确认不是漏镜）`);
+  const mentionsGap = packWarnings.some((item) => /镜号不连续|缺号|缺 \d|缺\d/.test(item));
+  if (gaps.length && !mentionsGap) {
+    warnings.push(`镜头号不连续：缺 ${gaps.join("、")}（分场空号，确认不是漏镜）`);
+  }
+  const mentionsFirst = packWarnings.some((item) => /首镜|从 ?01|从 ?1 起|增量/.test(item));
+  if (numbers.length && numbers[0] !== 1 && !mentionsFirst) {
+    warnings.push(`首镜是 ${numbers[0]}，不是 01：确认这份包不是增量或漏镜`);
+  }
+
+  // 08 里带的素材清单：编号 → 中文名，给卡片标签和素材表用
+  const assets = (Array.isArray(pack.assets) ? pack.assets : [])
+    .map((item) => {
+      const id = normalizeAssetCode(String((item && item.id) || "").trim());
+      if (!id) return null;
+      return {
+        id,
+        kind: String((item && item.kind) || "").trim(),
+        name: String((item && item.name) || "").trim(),
+        prompt: String((item && item.prompt) || "").trim(),
+        consistency: String((item && item.consistency) || "").trim(),
+        negative: String((item && item.negative) || "").trim(),
+      };
+    })
+    .filter(Boolean);
+  const assetNames = {};
+  assets.forEach((item) => {
+    const label = [item.kind, item.name].filter(Boolean).join("·");
+    if (label) assetNames[item.id] = label;
+  });
+
   return {
     title,
     scenes: [scene],
@@ -755,6 +914,8 @@ export function parsePromptPack(data, titleOverride) {
     params: tiers,
     tierMap: {},
     warnings,
+    assets,
+    assetNames,
     negativePrompt: String(pack.negativePrompt || "").trim(),
     source: "pack",
   };
@@ -829,7 +990,8 @@ export function parsePromptPackCsv(text, titleOverride) {
   const rows = parseCsvRows(text);
   if (!rows.length) return parsePromptPack({ title: "", shots: [] }, titleOverride);
   const header = rows[0].map((cell) => String(cell).trim());
-  const keys = header.map((name, index) => CSV_FIELD_MAP[name] || Object.values(CSV_FIELD_MAP)[index] || null);
+  // 只按表头名映射：列顺序、列数变了都不影响（06 现在是 14 列）
+  const keys = header.map((name) => CSV_FIELD_MAP[name] || null);
   const shots = rows.slice(1).map((cells) => {
     const shot = {};
     cells.forEach((cell, index) => {
@@ -904,7 +1066,11 @@ export function parseAnyStoryboard(text, titleOverride) {
     }
   }
   if (/【镜头\s*\d+】/.test(trimmed)) return parsePromptPackTxt(trimmed, titleOverride);
-  if (/^\uFEFF?"?镜头号"?\s*,/.test(trimmed)) return parsePromptPackCsv(trimmed, titleOverride);
+  // CSV 只看表头有没有「镜头号」，列顺序不固定（06 现在是 14 列，接点在第 3 列）
+  const firstLine = trimmed.split(/\r?\n/, 1)[0] || "";
+  if (/镜头号/.test(firstLine) && firstLine.includes(",")) {
+    return parsePromptPackCsv(trimmed, titleOverride);
+  }
   return parseStoryboard(text);
 }
 
