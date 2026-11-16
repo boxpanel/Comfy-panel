@@ -263,7 +263,7 @@ function spokenOf(value) {
   return match ? match[1].trim() : "";
 }
 
-/** 出包偶尔把分隔符和残留字段行写进正文：孤立的 #、---、`- 首帧补充：无` 都要剔掉 */
+/** 出包偶尔把分隔符和残留字段行写进正文：孤立的 #、---、`- 首帧补充：无`、双语包的重复 EN 行 */
 function stripPackNoise(value) {
   const kept = String(value || "")
     .split(/\r?\n/)
@@ -272,6 +272,7 @@ function stripPackNoise(value) {
       if (!text) return true;
       if (/^#{1,6}$/.test(text)) return false;
       if (/^(?:-{3,}|\*{3,})$/.test(text)) return false;
+      if (/^EN\s*[：:]/i.test(text)) return false;
       if (/^[-*]\s*[\u4e00-\u9fff]{1,8}\s*[：:]/.test(text)) return false;
       return true;
     });
@@ -493,12 +494,14 @@ export function parseAssetNames(text) {
     put(match[1], match[2].split(/[（(]/)[0]);
   }
 
-  // 新包标题：### S-01 · 角色 · 卫斯理 / ### E-02 · 场景 · 雪夜街道
+  // 新包标题：### S-01 · 角色 · 卫斯理 / ### E-02 · 场景 · 田宅·夜
   const headingRe = new RegExp(`^#{1,6}\\s*(${ASSET_CODE_PATTERN})\\s*[·・|｜:：]?\\s*([^\\n]*)$`, "gm");
+  const KIND_RE = /^(?:角色|人物|服装|服饰|道具|物品|场景|环境|风格|其他)$/;
   while ((match = headingRe.exec(text))) {
     const parts = match[2].split(/[·・|｜]/).map((part) => part.trim()).filter(Boolean);
-    if (parts.length >= 2) put(match[1], `${parts[0]}·${parts.slice(1).join("·")}`);
-    else if (parts.length === 1) put(match[1], parts[0]);
+    // 第二段是类型词时跳过，名称取后面全部（保住「田宅·夜」这类多段名）
+    const rest = parts.length > 1 && KIND_RE.test(parts[0]) ? parts.slice(1) : parts;
+    if (rest.length) put(match[1], rest.join("·"));
   }
 
   const listRe = /\*\*[^*]{0,8}：\*\*([^\n]+)/g;
@@ -636,6 +639,8 @@ export function parseStoryboard(rawText) {
     }
 
     if (unit) {
+      // 双语包把英文写在字段下一行（「  EN: …」）；面板只用中文首尾帧 + 英文视频提示词，这行跳过
+      if (/^\s*EN\s*[：:]/i.test(line)) continue;
       const bullet = line.match(
         /^\s*(?:[-*·]\s*)?(?:\*\*)?([^：:*]{1,14})(?:\*\*)?\s*[：:]\s*(?:\*\*)?\s*(.*)$/
       );
@@ -755,12 +760,18 @@ export function parseStoryboard(rawText) {
 export function normalizeJoint(value) {
   const text = String(value || "").trim().toLowerCase();
   if (!text) return "unknown";
-  // 「未标注接点 · 先按连续处理…请人工确认是否应改为硬切」整句里同时出现「连续」和「硬切」，
+  // 以标准标签开头的，直接按开头算（例：「连续 · 原稿未标注接点，已按连续处理」）
+  if (/^连续/.test(text)) return "cont";
+  if (/^切换/.test(text)) return "cut";
+  if (/^硬切/.test(text)) return "hard";
+  // 「未标注接点 · 暂按连续处理…请人工确认是否应改为硬切」整句里同时出现「连续」和「硬切」，
   // 必须先认出「未标注」，否则会被后面的关键字误判成硬切。
   if (/未标注|unknown|待确认|请人工确认/.test(text)) return "unknown";
   if (/hard|硬切/.test(text)) return "hard";
-  if (/cut|切换/.test(text)) return "cut";
-  if (/cont|连续/.test(text)) return "cont";
+  // 切换的说明里常写「只作身份参考」「构图按本镜重设」，要在连续之前判
+  if (/cut|切换|同场换机位|只作人物|身份参考，构图/.test(text)) return "cut";
+  // 04 的连续行只写「可把上一镜尾帧…作为视频参考」，没有「连续」两个字
+  if (/cont|连续|可把上一镜尾帧|作为视频参考|沿用上一镜/.test(text)) return "cont";
   return "unknown";
 }
 

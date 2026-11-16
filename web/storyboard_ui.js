@@ -13,7 +13,7 @@ import {
   parseFrameName,
   parseStoryboard,
   summarize,
-} from "./storyboard_parser.js?v=20261115e";
+} from "./storyboard_parser.js?v=20261116a";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -70,7 +70,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
-const PANEL_VERSION = `v53.24 · 接点 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.25 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -909,10 +909,17 @@ export function createStoryboardPanel(root, app) {
   }
 
   function assetCategory(code) {
-    if (/^S-/.test(code)) return "场景";
+    // 提示词包在 08 里声明了类型（角色/服装/道具/场景/风格/其他），以包为准
+    const shelf = (state.doc && state.doc.assets) || [];
+    const item = shelf.find((entry) => entry.id === canonicalCode(code));
+    if (item && item.kind) return item.kind;
+    // 旧手册没有类型字段，按旧编号习惯猜
+    if (/^ST-/.test(code)) return "风格";
+    if (/^R-/.test(code)) return "人物";
+    if (/^G-/.test(code)) return "群像";
     if (/^P-/.test(code) || /^T-P/.test(code)) return "道具";
     if (/^C-/.test(code)) return "参考";
-    if (/^G-/.test(code)) return "群像";
+    if (/^S-/.test(code)) return "场景";
     return "人物";
   }
 
