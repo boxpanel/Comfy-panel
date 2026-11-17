@@ -13,7 +13,7 @@ import {
   parseFrameName,
   parseStoryboard,
   summarize,
-} from "./storyboard_parser.js?v=20261117a";
+} from "./storyboard_parser.js?v=20261117b";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -70,7 +70,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
-const PANEL_VERSION = `v53.26 · 接点 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.27 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -546,11 +546,13 @@ export function createStoryboardPanel(root, app) {
       </div>
       <div class="sb-top-actions">
         <button class="sb-btn" data-el="pick">导入分镜</button>
+        <button class="sb-btn" data-el="pick-folder" title="选整个提示词包文件夹（含子目录）">文件夹</button>
         <button class="sb-btn" data-el="pick-assets">素材库</button>
         <button class="sb-btn" data-el="paste-toggle">粘贴</button>
         <button class="sb-btn" data-el="update" title="检查并更新插件（git pull，更新后刷新页面）">⟳</button>
       </div>
-      <input type="file" data-el="file" accept=".md,.markdown,.txt,.json,.csv,text/markdown,application/json,text/csv" multiple hidden>
+      <input type="file" data-el="file" accept=".md,.markdown,.txt,.json,.csv,.zip,text/markdown,application/json,text/csv,application/zip" multiple hidden>
+      <input type="file" data-el="pack-folder" webkitdirectory directory multiple hidden>
       <input type="file" data-el="folder" webkitdirectory directory multiple hidden>
     </div>
 
@@ -565,7 +567,7 @@ export function createStoryboardPanel(root, app) {
       <summary>怎么用（三步）</summary>
       <div class="sb-box-body">
         <ol>
-          <li><b>导入分镜</b>：点右上角「导入分镜」选 .md，或把文件拖进来；豆包提示词包优先选 <b>08-分镜表.json</b>，也可以一次多选 08 / 06 / 04（连同 03 素材表），镜数不一致时以 08 为准。</li>
+          <li><b>导入分镜</b>：点右上角「导入分镜」选 .md / .zip / 多个文件，或点「文件夹」选整个提示词包目录，也可以把文件 / 文件夹直接拖进来；豆包提示词包优先选 <b>08-分镜表.json</b>，也可以一次多选 08 / 06 / 04（连同 03 素材表），镜数不一致时以 08 为准。</li>
           <li><b>导入素材库</b>：点「素材库」选母库文件夹；文件名里带 S-01 / R-01 / S02-U01 的会自动对上。</li>
           <li><b>打开工作流</b>：在 ComfyUI 里打开你要用的图生视频工作流（面板顶部变绿就说明认到了）。</li>
           <li><b>按顺序做</b>：点下面的「应用下一镜」，素材会自动上传并填好，再回 ComfyUI 点「运行」；出完 4 条再回来点下一镜。</li>
@@ -3855,6 +3857,110 @@ export function createStoryboardPanel(root, app) {
     discussion: "07 是讨论记录，不含分镜",
   };
 
+  // ---------- 压缩包 ----------
+  /** zip 里的文件名可能是 UTF-8，也可能是本地编码（中文 Windows 常见 GBK） */
+  function decodeZipName(bytes, utf8Flag) {
+    const attempt = (encoding) => new TextDecoder(encoding, { fatal: true }).decode(bytes);
+    if (!utf8Flag) {
+      try {
+        return attempt("gbk");
+      } catch (error) {
+        /* 不是 GBK 就按 UTF-8 试 */
+      }
+    }
+    try {
+      return attempt("utf-8");
+    } catch (error) {
+      return new TextDecoder("utf-8").decode(bytes);
+    }
+  }
+
+  async function inflateRaw(bytes) {
+    if (typeof DecompressionStream === "undefined") {
+      throw new Error("当前浏览器不支持解压，请解压后选文件夹");
+    }
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+
+  /** 只取包里的文本镜表，图片等直接跳过；返回和 File 一样能 .text() 的条目 */
+  async function unzipPack(file) {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    const view = new DataView(buf.buffer);
+    let eocd = -1;
+    for (let i = buf.length - 22; i >= Math.max(0, buf.length - 66000); i -= 1) {
+      if (view.getUint32(i, true) === 0x06054b50) {
+        eocd = i;
+        break;
+      }
+    }
+    if (eocd < 0) throw new Error("不是有效的 zip 文件");
+    const count = view.getUint16(eocd + 10, true);
+    let ptr = view.getUint32(eocd + 16, true);
+    const out = [];
+    for (let index = 0; index < count; index += 1) {
+      if (ptr + 46 > buf.length || view.getUint32(ptr, true) !== 0x02014b50) break;
+      const flags = view.getUint16(ptr + 8, true);
+      const method = view.getUint16(ptr + 10, true);
+      const compSize = view.getUint32(ptr + 20, true);
+      const nameLen = view.getUint16(ptr + 28, true);
+      const extraLen = view.getUint16(ptr + 30, true);
+      const commentLen = view.getUint16(ptr + 32, true);
+      const localOff = view.getUint32(ptr + 42, true);
+      const name = decodeZipName(buf.subarray(ptr + 46, ptr + 46 + nameLen), !!(flags & 0x800)).replace(/\\/g, "/");
+      ptr += 46 + nameLen + extraLen + commentLen;
+      // 目录、macOS 附属文件、非文本都跳过
+      if (/\/$/.test(name) || /(^|\/)__MACOSX\//.test(name) || /(^|\/)\._/.test(name)) continue;
+      if (!/\.(md|markdown|txt|csv|json)$/i.test(name)) continue;
+      if (view.getUint32(localOff, true) !== 0x04034b50) continue;
+      const localNameLen = view.getUint16(localOff + 26, true);
+      const localExtraLen = view.getUint16(localOff + 28, true);
+      const start = localOff + 30 + localNameLen + localExtraLen;
+      const data = buf.subarray(start, start + compSize);
+      let raw = data;
+      if (method === 8) {
+        raw = await inflateRaw(data);
+      } else if (method !== 0) {
+        continue;
+      }
+      const text = new TextDecoder("utf-8").decode(raw).replace(/^\uFEFF/, "");
+      out.push({
+        name: name.split("/").pop(),
+        path: name,
+        size: text.length,
+        text: async () => text,
+      });
+    }
+    return out;
+  }
+
+  /** 拖文件夹进来时递归取里面的文件 */
+  function entryFiles(entry, out) {
+    return new Promise((resolve) => {
+      if (!entry) return resolve();
+      if (entry.isFile) {
+        entry.file(
+          (file) => {
+            out.push(file);
+            resolve();
+          },
+          () => resolve()
+        );
+        return;
+      }
+      if (!entry.isDirectory) return resolve();
+      const reader = entry.createReader();
+      const readBatch = () => {
+        reader.readEntries(async (batch) => {
+          if (!batch.length) return resolve();
+          for (const child of batch) await entryFiles(child, out);
+          readBatch();
+        }, () => resolve());
+      };
+      readBatch();
+    });
+  }
+
   function packKindOf(name, text) {
     const lower = String(name || "").toLowerCase();
     const head = String(text || "").slice(0, 6000);
@@ -3871,14 +3977,45 @@ export function createStoryboardPanel(root, app) {
 
   /** 多选导入：以 08 JSON 为主源，其余文件只做镜数核对 / 素材名称补全 */
   async function importFiles(fileList) {
-    const files = Array.from(fileList || []).filter(
-      (file) => file && file.name && !file.name.startsWith(".") && !/\.(docx?|pdf|pptx?|xlsx?)$/i.test(file.name)
+    const raw = Array.from(fileList || []);
+    // 文件夹里会混着图片：只留文本镜表 + zip
+    const files = raw.filter(
+      (file) =>
+        file &&
+        file.name &&
+        !file.name.startsWith(".") &&
+        /\.(md|markdown|txt|csv|json|zip)$/i.test(file.name)
     );
+    if (raw.length > files.length) {
+      logLine(`已忽略 ${raw.length - files.length} 个非文本文件（图片等）`, "info");
+    }
     if (!files.length) return;
-    if (files.length === 1) return importFile(files[0]);
+
+    // 压缩包：先解出里面的文本，再按多选流程走
+    const expanded = [];
+    for (const file of files) {
+      if (!/\.zip$/i.test(file.name)) {
+        expanded.push(file);
+        continue;
+      }
+      try {
+        const inner = await unzipPack(file);
+        if (!inner.length) {
+          logLine(`${file.name} 里没有可解析的文本镜表`, "warn");
+        } else {
+          logLine(`已解压 ${file.name}：${inner.length} 个文本文件`, "ok");
+          expanded.push(...inner);
+        }
+      } catch (error) {
+        logLine(`解压 ${file.name} 失败：${error.message}`, "err");
+        toast(`解压 ${file.name} 失败：${error.message}`, "err");
+      }
+    }
+    if (!expanded.length) return;
+    if (expanded.length === 1) return importFile(expanded[0]);
 
     const entries = [];
-    for (const file of files) {
+    for (const file of expanded) {
       if (file.size > 4 * 1024 * 1024) {
         logLine(`跳过 ${file.name}：超过 4MB`, "warn");
         continue;
@@ -3954,6 +4091,14 @@ export function createStoryboardPanel(root, app) {
   el.pick.addEventListener("click", () => el.file.click());
 
   el["pick-assets"].addEventListener("click", () => el.folder.click());
+
+  el["pick-folder"].addEventListener("click", () => el["pack-folder"].click());
+
+  el["pack-folder"].addEventListener("change", () => {
+    const files = Array.from(el["pack-folder"].files || []);
+    el["pack-folder"].value = "";
+    importFiles(files).catch((error) => toast("读取文件失败：" + error.message, "err"));
+  });
 
   el.folder.addEventListener("change", () => {
     const files = Array.from(el.folder.files || []);
@@ -4451,7 +4596,26 @@ export function createStoryboardPanel(root, app) {
     event.stopPropagation();
     dragDepth = 0;
     root.classList.remove("dragging");
-    const files = event.dataTransfer ? Array.from(event.dataTransfer.files || []) : [];
+    const dataTransfer = event.dataTransfer;
+    if (!dataTransfer) return;
+    // 拖进来的可能是文件夹或 zip：先把 entry 同步取出来（异步后 items 会失效）
+    const entries = Array.from(dataTransfer.items || [])
+      .map((item) => (item.webkitGetAsEntry ? item.webkitGetAsEntry() : null))
+      .filter(Boolean);
+    if (entries.length) {
+      const collected = [];
+      Promise.all(entries.map((entry) => entryFiles(entry, collected)))
+        .then(() => {
+          if (collected.length) {
+            return importFiles(collected);
+          }
+          const files = Array.from(dataTransfer.files || []);
+          return files.length ? importFiles(files) : undefined;
+        })
+        .catch((error) => toast("读取文件失败：" + error.message, "err"));
+      return;
+    }
+    const files = Array.from(dataTransfer.files || []);
     if (files.length) importFiles(files).catch((error) => toast("读取文件失败：" + error.message, "err"));
   });
 
