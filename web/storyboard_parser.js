@@ -314,8 +314,11 @@ function fieldOf(key) {
 const SHOT_FIELD_MAP = {
   时长: "durationText",
   主体状态: "subject",
+  画面主体: "subject",
   环境与光照: "environment",
+  环境: "environment",
   机位与运镜: "camera",
+  景别机位: "camera",
   时间流逝: "elapsed",
   空间锚点: "anchor",
   首帧提示词: "firstFramePrompt",
@@ -334,8 +337,12 @@ const SHOT_FIELD_MAP = {
 function shotFieldOf(key) {
   // 「视频提示词（台词）」「视频提示词补充」都是台词，不占画面提示词
   if (/^视频提示词\s*(?:[（(]台词[）)]|补充)/.test(key)) return "dialogueText";
+  // 「视频提示词（可直接投喂）」等括号说明仍按英文画面提示词
+  if (/^视频提示词/.test(key)) return "promptEn";
   // 「首帧补充：无」这类残留行直接忽略
   if (/^(?:首帧|尾帧)补充$/.test(key) || /^主体口型$/.test(key)) return null;
+  // 试拍稿的英文首/尾帧单列一行，中文优先，英文跳过
+  if (/^(?:first|last)\s*frame\b/i.test(key)) return null;
   return SHOT_FIELD_MAP[key] || fieldOf(key);
 }
 
@@ -344,11 +351,20 @@ function parseUnitHeading(rawLine) {
   let text = rawLine.trim().replace(/^(?:镜号|镜头|分镜)\s*[：:]\s*/i, "");
   if (!text || /^\|/.test(text)) return null;
 
-  // 兜底：「镜头 17」「### 镜头 26」这种只有镜号的标题，分镜提示词包用得多
-  const shotMatch = text.match(/^#{0,4}\s*镜头\s*(\d{1,3})\s*$/);
+  // 兜底：「镜头 17」「### 镜头 26」「### 镜头 01（0:00—0:05 · 5s）」这种只有镜号的标题
+  const shotMatch = text.match(/^#{0,4}\s*镜头\s*(\d{1,3})\s*(?:[（(]([^）)]*)[）)])?\s*$/);
   if (shotMatch) {
     const label = String(Number(shotMatch[1])).padStart(2, "0");
-    return { sceneNo: 1, label, id: `S01-U${label}`, parts: [], tier: "", shotStyle: true };
+    const tail = shotMatch[2] || "";
+    const seconds = (tail.match(/(\d+(?:\.\d+)?)\s*(?:s|秒)/i) || [])[1] || "";
+    return {
+      sceneNo: 1,
+      label,
+      id: `S01-U${label}`,
+      parts: seconds ? [`${seconds}s`] : [],
+      tier: "",
+      shotStyle: true,
+    };
   }
 
   if (!/S\d{1,2}\s*[-_－—]?\s*U\d+[a-zA-Z]?/i.test(text)) return null;
@@ -488,20 +504,24 @@ export function parseAssetNames(text) {
     if (!names[code]) names[code] = clean;
   };
 
-  const rowRe = new RegExp(`^\\|\\s*(${ASSET_CODE_PATTERN})\\s*\\|\\s*([^|]+)\\|`, "gm");
+  const KIND_WORD = /^(?:角色|人物|服装|服饰|道具|物品|场景|环境|风格|其他|群像)$/;
+  // 表格可能是 |编号|名称|用途|，也可能是 |编号|类别|名称|文件名|（试拍段素材清单）
+  const rowRe = new RegExp(`^\\|\\s*(${ASSET_CODE_PATTERN})\\s*\\|\\s*([^|\\n]+)\\|\\s*([^|\\n]*)\\|?`, "gm");
   let match;
   while ((match = rowRe.exec(text))) {
-    put(match[1], match[2].split(/[（(]/)[0]);
+    const second = match[2].trim();
+    const third = (match[3] || "").trim();
+    const name = KIND_WORD.test(second) && third && !/\.png$|不出图/i.test(third) ? third : second;
+    put(match[1], name.split(/[（(]/)[0]);
   }
 
-  // 新包标题：### S-01 · 角色 · 卫斯理 / ### E-02 · 场景 · 田宅·夜
+  // 新包标题：### S-01 · 角色 · 卫斯理 / ### E-02 · 场景 · 田宅·夜 / #### E-01 · 卫斯理的办公室（场景）
   const headingRe = new RegExp(`^#{1,6}\\s*(${ASSET_CODE_PATTERN})\\s*[·・|｜:：]?\\s*([^\\n]*)$`, "gm");
-  const KIND_RE = /^(?:角色|人物|服装|服饰|道具|物品|场景|环境|风格|其他)$/;
   while ((match = headingRe.exec(text))) {
     const parts = match[2].split(/[·・|｜]/).map((part) => part.trim()).filter(Boolean);
     // 第二段是类型词时跳过，名称取后面全部（保住「田宅·夜」这类多段名）
-    const rest = parts.length > 1 && KIND_RE.test(parts[0]) ? parts.slice(1) : parts;
-    if (rest.length) put(match[1], rest.join("·"));
+    const rest = parts.length > 1 && KIND_WORD.test(parts[0]) ? parts.slice(1) : parts;
+    if (rest.length) put(match[1], rest.join("·").replace(/[（(](?:角色|服装|道具|场景|风格|其他|人物|群像)[）)]\s*$/, ""));
   }
 
   const listRe = /\*\*[^*]{0,8}：\*\*([^\n]+)/g;
