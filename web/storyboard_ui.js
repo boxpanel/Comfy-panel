@@ -13,7 +13,7 @@ import {
   parseFrameName,
   parseStoryboard,
   summarize,
-} from "./storyboard_parser.js?v=20261116a";
+} from "./storyboard_parser.js?v=20261117a";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -70,7 +70,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
-const PANEL_VERSION = `v53.25 · 接点 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.26 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -3821,24 +3821,51 @@ export function createStoryboardPanel(root, app) {
     }
     try {
       const text = await file.text();
+      const kind = packKindOf(file.name, text);
+      if (PACK_KIND_HINT[kind]) {
+        toast(PACK_KIND_HINT[kind], "info");
+        return;
+      }
       importRaw(text, file.name);
     } catch (error) {
       toast("读取文件失败：" + error.message, "err");
     }
   }
 
-  // 提示词包里的三类镜表 + 两张附表，按内容认，不靠文件名
+  // 提示词包里的三类镜表 + 几张附表，按内容认；文件名前缀作兜底（00~09 是出包端固定编号）
   const PACK_KIND_LABEL = { json: "08 JSON", csv: "06 CSV", txt: "04 TXT", shots: "01 分镜", assets: "03 素材", frames: "02 首尾帧" };
+  const PACK_FILE_KIND = {
+    "00": "doc",
+    "01": "shots",
+    "02": "frames",
+    "03": "assets",
+    "04": "txt",
+    "05": "negative",
+    "06": "csv",
+    "07": "discussion",
+    "08": "json",
+    "09": "frames",
+  };
+  // 附表单独导入时只提示用途，不报「没找到镜号」
+  const PACK_KIND_HINT = {
+    assets: "03 是素材表：请和 08 / 01 一起多选导入，用来补素材名称",
+    frames: "02 是首尾帧表：首尾帧已随 08 / 01 进卡，不用单独导入",
+    negative: "05 是负向提示词：请导入 08 或 01，负向会一并读入",
+    doc: "00 是项目说明，不含分镜",
+    discussion: "07 是讨论记录，不含分镜",
+  };
 
   function packKindOf(name, text) {
     const lower = String(name || "").toLowerCase();
     const head = String(text || "").slice(0, 6000);
+    const prefix = (String(name || "").match(/^(\d{2})[-_. ]/) || [])[1];
+    if (prefix && PACK_FILE_KIND[prefix]) return PACK_FILE_KIND[prefix];
     if (/\.json$/i.test(lower) || /^\uFEFF?\s*\{/.test(head)) return "json";
     if (/\.csv$/i.test(lower) || (/镜头号/.test(head.split(/\r?\n/, 1)[0] || "") && head.includes(","))) return "csv";
-    if (/\.txt$/i.test(lower) || /【镜头\s*\d+】/.test(head)) return "txt";
+    if (/【镜头\s*\d+】/.test(head)) return "txt";
     if (/素材提示词|素材清单/.test(head) || /^###\s*(?:ST|S|C|P|E|R|T|G)-\d{2}\s*[·・]/m.test(head)) return "assets";
     if (/首帧提示词\s*[（(]/.test(head)) return "frames";
-    if (/镜头\s*\d+/.test(head)) return "shots";
+    if (/^#{1,6}\s*镜头\s*\d+/m.test(head)) return "shots";
     return "";
   }
 
@@ -3865,17 +3892,27 @@ export function createStoryboardPanel(root, app) {
     entries.forEach((entry) => {
       entry.kind = packKindOf(entry.file.name, entry.text);
     });
+    // 附表不参与主源与镜数核对：03 只用于补名称，02 只提示，00/05/07 直接忽略
+    const ignored = entries.filter((entry) => ["doc", "discussion", "negative"].includes(entry.kind));
+    const usable = entries.filter((entry) => !PACK_KIND_HINT[entry.kind]);
+    if (ignored.length) {
+      logLine(`已忽略非镜表：${ignored.map((entry) => entry.file.name).join("、")}`, "info");
+    }
+    if (!usable.length) {
+      toast(PACK_KIND_HINT[entries[0].kind] || "选中的文件里没有镜表（08 / 06 / 04 / 01）", "info");
+      return;
+    }
 
     const primaryOrder = ["json", "csv", "txt", "shots"];
-    const primary = primaryOrder.map((kind) => entries.find((entry) => entry.kind === kind)).find(Boolean);
-    const main = primary || entries[0];
+    const primary = primaryOrder.map((kind) => usable.find((entry) => entry.kind === kind)).find(Boolean);
+    const main = primary || usable[0];
     if (!main) return;
     importRaw(main.text, main.file.name);
 
     // 同一份包的几份镜表：镜数不一致就以主源为准，并在日志里说清楚
     const counts = primaryOrder
       .map((kind) => {
-        const entry = entries.find((item) => item.kind === kind);
+        const entry = usable.find((item) => item.kind === kind);
         if (!entry) return null;
         try {
           return { kind, total: parseAnyStoryboard(entry.text).units.length, name: entry.file.name };
