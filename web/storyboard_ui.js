@@ -13,7 +13,7 @@ import {
   parseFrameName,
   parseStoryboard,
   summarize,
-} from "./storyboard_parser.js?v=20261117d";
+} from "./storyboard_parser.js?v=20261117e";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -70,7 +70,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
-const PANEL_VERSION = `v53.29 · 接点 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.30 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -147,11 +147,17 @@ const CSS = `
 .sb-paste-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
 .sb-hint{color:var(--sb-muted);font-size:10.5px;}
 .sb-upload{margin:6px 0 2px;padding:7px 8px;border:1px solid var(--sb-line);border-radius:6px;background:var(--sb-card);}
-.sb-upload-meta{display:flex;align-items:baseline;gap:8px;margin-bottom:5px;font-size:10.5px;}
-.sb-upload-meta span:first-child{color:var(--sb-fg);font-weight:500;}
+.sb-upload-meta{display:flex;align-items:center;gap:8px;margin-bottom:5px;font-size:10.5px;flex-wrap:wrap;}
+.sb-upload-meta [data-el="upload-text"]{color:var(--sb-fg);font-weight:500;}
 .sb-upload-track{height:6px;border-radius:3px;background:rgba(127,127,127,.22);overflow:hidden;}
 .sb-upload-fill{height:100%;width:0;border-radius:3px;background:var(--sb-accent);transition:width .18s ease;}
 .sb-upload.done .sb-upload-fill{background:#22c55e;}
+.sb-upload-spin{
+  display:none;width:9px;height:9px;border:2px solid rgba(127,127,127,.35);
+  border-top-color:var(--sb-accent);border-radius:50%;animation:sb-spin .8s linear infinite;
+}
+.sb-upload.running .sb-upload-spin{display:inline-block;}
+@keyframes sb-spin{to{transform:rotate(360deg);}}
 .sb-ready{
   display:flex;align-items:center;gap:6px;margin:0 10px 8px;padding:6px 8px;border-radius:7px;
   border:1px solid var(--sb-line);background:var(--sb-card);font-size:10.5px;color:var(--sb-muted);
@@ -1042,8 +1048,9 @@ export function createStoryboardPanel(root, app) {
         libraryFiles().length
           ? `<div class="sb-upload" data-el="upload-progress" hidden>
                <div class="sb-upload-meta">
+                 <span class="sb-upload-spin"></span>
                  <span data-el="upload-text">已上传 0 / 0 个</span>
-                 <span class="sb-hint grow">图片和音频一起算，上传中断或切页都不会停</span>
+                 <span class="sb-hint grow">图片和音频一起算；切侧栏页不会停，刷新/关页会中断，之后重新选素材库补传</span>
                </div>
                <div class="sb-upload-track"><div class="sb-upload-fill" data-el="upload-fill"></div></div>
              </div>`
@@ -2600,7 +2607,10 @@ export function createStoryboardPanel(root, app) {
     if (entry.uploadedName) return entry.uploadedName;
     if (!entry.image && !entry.audio) return null;
     let file = fileHandles.get(entry.path);
-    if (!file) return null;
+    if (!file) {
+      entry.uploadError = "本次会话没有这个文件（刷新/切页后要重新点「素材库」选文件夹）";
+      return null;
+    }
     let uploadName = entry.name;
     if (entry.image && settings().cutout) {
       try {
@@ -2618,17 +2628,25 @@ export function createStoryboardPanel(root, app) {
       form.append("image", file, uploadName);
       form.append("overwrite", "true");
       const response = await fetch("/upload/image", { method: "POST", body: form });
-      if (!response.ok) return null;
+      if (!response.ok) {
+        entry.uploadError = `服务器返回 ${response.status}${response.statusText ? " " + response.statusText : ""}`;
+        return null;
+      }
       const data = await response.json();
       const name = data && data.name ? (data.subfolder ? `${data.subfolder}/${data.name}` : data.name) : "";
-      if (!name) return null;
+      if (!name) {
+        entry.uploadError = "服务器没返回文件名";
+        return null;
+      }
       entry.uploadedName = name;
+      entry.uploadError = "";
       if (persistNow) {
         saveLibraryStore();
         persist();
       }
       return name;
     } catch (error) {
+      entry.uploadError = error && error.message ? error.message : "上传异常（网络或 ComfyUI 未响应）";
       return null;
     }
   }
@@ -2663,7 +2681,8 @@ export function createStoryboardPanel(root, app) {
     const done = librarySync ? Math.max(librarySync.done, uploaded) : uploaded;
     const percent = total ? Math.round((done / total) * 100) : 0;
     wrap.hidden = false;
-    wrap.classList.toggle("done", percent >= 100);
+    wrap.classList.toggle("running", !!(librarySync && librarySync.running));
+    wrap.classList.toggle("done", percent >= 100 && !(librarySync && librarySync.running));
     const text = wrap.querySelector('[data-el="upload-text"]');
     if (text) {
       const failed = librarySync && librarySync.failed ? librarySync.failed : 0;
@@ -2692,6 +2711,7 @@ export function createStoryboardPanel(root, app) {
       done: entries.length - pending.length,
       uploaded: entries.length - pending.length,
       failed: 0,
+      reasons: [],
       running: true,
       cancelled: false,
     };
@@ -2704,6 +2724,17 @@ export function createStoryboardPanel(root, app) {
       toast(`素材已经在 ComfyUI input 里（${entries.length} 个），不用重复上传`, "ok");
       return;
     }
+    // 刷新 / 切页后文件句柄会丢，先明确告诉用户要重新选文件夹，不要空跑一轮再报失败
+    if (pending.every((entry) => !fileHandles.has(entry.path))) {
+      job.failed = pending.length;
+      job.running = false;
+      job.reasons = [{ name: pending[0].name, reason: "本次会话没有这些文件（刷新/切页后要重新点「素材库」选文件夹）" }];
+      saveLibraryStore();
+      libraryListener();
+      renderAssets();
+      toast("素材文件不在本次会话：请重新点「素材库」选文件夹后再上传（已传过的不会重传）", "err");
+      return;
+    }
     let cursor = 0;
     const worker = async () => {
       while (cursor < pending.length) {
@@ -2711,11 +2742,17 @@ export function createStoryboardPanel(root, app) {
         cursor += 1;
         if (job.cancelled) return;
         if (!fileHandles.has(entry.path)) {
+          entry.uploadError = "本次会话没有这个文件（刷新/切页后要重新点「素材库」选文件夹）";
           job.failed += 1;
+          job.reasons.push({ name: entry.name, reason: entry.uploadError });
         } else {
           const name = await uploadAsset(entry, false);
-          if (name) job.uploaded += 1;
-          else job.failed += 1;
+          if (name) {
+            job.uploaded += 1;
+          } else {
+            job.failed += 1;
+            job.reasons.push({ name: entry.name, reason: entry.uploadError || "未知原因" });
+          }
         }
         job.done += 1;
         // 服务器上传慢时进度条要一点点走，所以每个文件完成都刷新一次
@@ -2732,10 +2769,19 @@ export function createStoryboardPanel(root, app) {
       renderAssets();
       const { uploaded, failed, total } = job;
       if (!job.cancelled) {
-        toast(
-          `素材已上传 ${uploaded}/${total} 个到 ComfyUI input${failed ? `，${failed} 个失败（文件不在本次会话）` : ""}`,
-          failed ? "err" : "ok"
-        );
+        if (failed) {
+          const reasons = [...new Set(job.reasons.map((item) => item.reason))];
+          logLine(
+            `上传失败 ${failed} 个：${job.reasons
+              .slice(0, 5)
+              .map((item) => `${item.name}（${item.reason}）`)
+              .join("；")}${failed > 5 ? "…" : ""}`,
+            "err"
+          );
+          toast(`素材已上传 ${uploaded}/${total} 个，${failed} 个失败：${reasons[0]}`, "err");
+        } else {
+          toast(`素材已上传 ${uploaded}/${total} 个到 ComfyUI input`, "ok");
+        }
       }
     }
   }
@@ -4617,6 +4663,14 @@ export function createStoryboardPanel(root, app) {
     }
     const files = Array.from(dataTransfer.files || []);
     if (files.length) importFiles(files).catch((error) => toast("读取文件失败：" + error.message, "err"));
+  });
+
+  // 上传在跑的时候刷新/关页会中断，先拦一下
+  window.addEventListener("beforeunload", (event) => {
+    if (librarySync && librarySync.running) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
   });
 
   el.guide.open = !state.doc;
