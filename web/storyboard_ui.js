@@ -70,7 +70,7 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
-const PANEL_VERSION = `v53.32 · 接点 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.33 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -130,6 +130,22 @@ const CSS = `
 .sb-btn.primary{background:var(--sb-accent);border-color:var(--sb-accent);color:#fff;}
 .sb-btn.primary:hover{filter:brightness(1.08);}
 .sb-btn.dim{color:var(--sb-muted);}
+.sb-btn.ok{border-color:#3fb950;color:#3fb950;}
+.sb-btn.bad{border-color:#f85149;color:#f85149;}
+/* 分镜验收：合格浅绿底、不合格浅红底，待检保持原色 */
+.sb-card.is-pass{background:rgba(63,185,80,.10);border-color:rgba(63,185,80,.45);}
+.sb-card.is-fail{background:rgba(248,81,73,.10);border-color:rgba(248,81,73,.5);}
+.sb-verdict{
+  font-size:9.5px;padding:1px 6px;border-radius:9px;white-space:nowrap;cursor:pointer;
+  border:1px solid var(--sb-line);color:var(--sb-muted);background:transparent;user-select:none;
+}
+.sb-verdict.pass{border-color:#3fb950;color:#3fb950;font-weight:600;}
+.sb-verdict.fail{border-color:#f85149;color:#f85149;font-weight:600;}
+.sb-video{display:flex;align-items:center;gap:6px;font-size:10.5px;color:var(--sb-muted);word-break:break-all;}
+.sb-video b{color:var(--sb-fg);font-weight:500;}
+.sb-player{display:flex;justify-content:center;background:#000;border-radius:6px;overflow:hidden;}
+.sb-player video{display:block;max-width:100%;max-height:68vh;}
+.sb-modal-foot .grow{flex:1 1 auto;min-width:0;}
 .sb-paste{padding:0 10px 8px;display:flex;flex-direction:column;gap:6px;}
 .sb-paste textarea{
   width:100%;height:120px;resize:vertical;border-radius:6px;border:1px solid var(--sb-line);
@@ -183,6 +199,21 @@ const CSS = `
 .sb-ov th,.sb-ov td{border-bottom:1px solid var(--sb-line);padding:2px 3px;text-align:left;white-space:nowrap;}
 .sb-ov th{color:var(--sb-muted);font-weight:500;}
 .sb-ov td.done{color:#3fb950;}
+.sb-ov tr.pass td{background:rgba(63,185,80,.10);}
+.sb-ov tr.fail td{background:rgba(248,81,73,.10);}
+.sb-ov td.verdict.pass{color:#3fb950;font-weight:600;}
+.sb-ov td.verdict.fail{color:#f85149;font-weight:600;}
+.sb-ov td.video{color:var(--sb-muted);max-width:220px;overflow:hidden;text-overflow:ellipsis;}
+.sb-ov .ov-btn{
+  margin-left:3px;padding:0 3px;border:1px solid var(--sb-line);border-radius:3px;
+  background:transparent;color:var(--sb-muted);font-size:10px;line-height:1.4;cursor:pointer;
+}
+.sb-ov .ov-btn.pass:hover{border-color:#3fb950;color:#3fb950;}
+.sb-ov .ov-btn.fail:hover{border-color:#f85149;color:#f85149;}
+.sb-ov .ov-link{
+  padding:0;border:none;background:transparent;color:var(--sb-accent);font-size:10px;
+  cursor:pointer;text-decoration:underline;text-underline-offset:2px;
+}
 .sb-todo{display:inline-flex;align-items:center;gap:4px;color:var(--sb-muted);font-size:10.5px;white-space:nowrap;cursor:pointer;}
 .sb-guide ol{margin:0;padding-left:16px;display:flex;flex-direction:column;gap:3px;font-size:11px;line-height:1.55;}
 .sb-guide li::marker{color:var(--sb-accent);font-weight:700;}
@@ -429,12 +460,16 @@ function loadState() {
     tags: saved.tags && typeof saved.tags === "object" ? saved.tags : {},
     // 每镜生成出来的视频（自动模式记录），供下一镜当参考视频/抽末帧用
     shots: saved.shots && typeof saved.shots === "object" ? saved.shots : {},
+    // 每镜最近一次成片：只给列表显示视频名/回看用，不参与接续
+    videos: saved.videos && typeof saved.videos === "object" ? saved.videos : {},
     // 本镜手动从上一镜末帧取的图（key 是单元编号）
     continuity: saved.continuity && typeof saved.continuity === "object" ? saved.continuity : {},
     // 自动模式最后一条状态（停在哪、为什么停）
     autoNote: typeof saved.autoNote === "string" ? saved.autoNote : "",
     // 每镜的武打开关（用户手动覆盖自动判断，true/false）
     fight: saved.fight && typeof saved.fight === "object" ? saved.fight : {},
+    // 每镜验收结论："pass" 合格 / "fail" 不合格（没有 = 待检）
+    verdict: saved.verdict && typeof saved.verdict === "object" ? saved.verdict : {},
     // 面板日志：做过什么、哪里报错（刷新页面后还留着）
     log: Array.isArray(saved.log) ? saved.log.slice(-200) : [],
     draftBase:
@@ -535,6 +570,8 @@ export function createStoryboardPanel(root, app) {
   let applying = false;
   // 全自动：应用一镜 → 排队 → 等生成完成 → 下一镜
   let autoRunning = false;
+  // 「只重跑不合格」时锁定的镜号名单；null = 正常按顺序做
+  let autoRetryIds = null;
   let autoStopRequested = false;
   // 记录上一镜写进加载图像节点的首帧，下一镜没有素材时要把它清掉
   let lastAppliedImage = null;
@@ -784,9 +821,11 @@ export function createStoryboardPanel(root, app) {
           images: state.images,
           tags: state.tags,
           shots: state.shots,
+          videos: state.videos,
           continuity: state.continuity,
           autoNote: state.autoNote || "",
           fight: state.fight,
+          verdict: state.verdict,
           log: state.log.slice(-200),
           draftBase: state.draftBase,
         })
@@ -1216,12 +1255,15 @@ export function createStoryboardPanel(root, app) {
       return;
     }
     const head =
-      "<tr><th>编号</th><th>档</th><th>时长</th><th>景别</th><th>步数</th><th>采样器</th><th>shift</th><th>输出前缀</th><th>状态</th></tr>";
+      "<tr><th>编号</th><th>档</th><th>时长</th><th>景别</th><th>步数</th><th>采样器</th><th>shift</th><th>输出前缀</th><th>验收</th><th>成片</th><th>状态</th></tr>";
     const rows = state.doc.units
       .map((unit) => {
         const params = unit.params || cloneTierDefaults().B;
         const done = !!state.applied[unit.id];
-        return `<tr>
+        const verdict = state.verdict[unit.id];
+        const label = verdict === "pass" ? "合格" : verdict === "fail" ? "不合格" : "待检";
+        const video = state.videos[unit.id];
+        return `<tr class="${verdict === "fail" ? "fail" : verdict === "pass" ? "pass" : ""}">
           <td>${escapeHtml(unit.id)}</td>
           <td>${escapeHtml(unit.tier)}</td>
           <td>${escapeHtml(unit.durationText || "-")}</td>
@@ -1230,6 +1272,18 @@ export function createStoryboardPanel(root, app) {
           <td>${escapeHtml(params.sampler)}</td>
           <td>${params.shift}</td>
           <td>${escapeHtml(unit.id + "_")}</td>
+          <td class="verdict ${verdict || ""}">
+            <span class="v-label">${label}</span>
+            <button class="ov-btn pass" data-ov="pass" data-id="${escapeHtml(unit.id)}" title="标为合格">✓</button>
+            <button class="ov-btn fail" data-ov="fail" data-id="${escapeHtml(unit.id)}" title="标为不合格，下次自动只重跑这几镜">✗</button>
+          </td>
+          <td class="video">${
+            video && video.filename
+              ? `<button class="ov-link" data-ov="watch" data-id="${escapeHtml(unit.id)}" title="在面板里看这一镜的成片">${escapeHtml(
+                  video.filename
+                )}</button>`
+              : "-"
+          }</td>
           <td class="${done ? "done" : ""}">${done ? "✓" : ""}</td>
         </tr>`;
       })
@@ -1238,18 +1292,26 @@ export function createStoryboardPanel(root, app) {
   }
 
   function renderProgress() {
-    const total = state.doc ? state.doc.units.length : 0;
-    const done = state.doc ? state.doc.units.filter((unit) => state.applied[unit.id]).length : 0;
+    const units = state.doc ? state.doc.units : [];
+    const total = units.length;
+    const done = units.filter((unit) => state.applied[unit.id]).length;
+    const pass = units.filter((unit) => state.verdict[unit.id] === "pass").length;
+    const fail = units.filter((unit) => state.verdict[unit.id] === "fail").length;
     const percent = total ? Math.round((done / total) * 100) : 0;
-    if (el["progress-text"]) el["progress-text"].textContent = `已做 ${done} / ${total}`;
+    if (el["progress-text"]) {
+      el["progress-text"].textContent = `已做 ${done} / ${total}${
+        pass || fail ? ` · 合格 ${pass} · 不合格 ${fail}` : ""
+      }`;
+    }
     if (el["progress-bar"]) el["progress-bar"].style.width = `${percent}%`;
     if (!el.next) return;
     if (!total) {
       el.next.textContent = "▶ 应用下一镜";
       return;
     }
-    const next = visibleUnits().find((unit) => !state.applied[unit.id]);
-    el.next.textContent = next ? `▶ 下一镜：${next.id}` : "▶ 这一批做完了";
+    const failed = units.find((unit) => state.verdict[unit.id] === "fail" && !state.applied[unit.id]);
+    const next = failed || visibleUnits().find((unit) => !state.applied[unit.id]);
+    el.next.textContent = next ? `▶ ${failed ? "重跑" : "下一镜"}：${next.id}` : "▶ 这一批做完了";
     renderFrameSelector();
   }
 
@@ -2163,6 +2225,79 @@ export function createStoryboardPanel(root, app) {
     }
   }
 
+  /** 输出视频的 /view 地址（看视频用） */
+  function shotViewUrl(shot) {
+    const query = new URLSearchParams({
+      filename: shot.filename,
+      subfolder: shot.subfolder || "",
+      type: shot.type || "output",
+    });
+    return typeof api.apiURL === "function" ? api.apiURL(`/view?${query.toString()}`) : `/view?${query}`;
+  }
+
+  let playerWrap = null;
+  function closePlayer() {
+    if (playerWrap && playerWrap.parentNode) playerWrap.parentNode.removeChild(playerWrap);
+    playerWrap = null;
+  }
+
+  /** 面板内看这一镜的视频，看完直接标合格 / 不合格 */
+  function openShotPlayer(unitId) {
+    const shot = state.videos[unitId];
+    if (!shot || !shot.filename) {
+      toast("这一镜还没有生成视频", "err");
+      return;
+    }
+    closePlayer();
+    const wrap = document.createElement("div");
+    wrap.className = "sb-modal";
+    wrap.innerHTML = `
+      <div class="sb-modal-box">
+        <div class="sb-modal-head">
+          <b>${escapeHtml(unitId)}</b>
+          <span class="sb-hint">${escapeHtml(shot.filename)}</span>
+          <button class="sb-btn dim" data-player="close">×</button>
+        </div>
+        <div class="sb-player"><video controls autoplay playsinline src="${escapeHtml(shotViewUrl(shot))}"></video></div>
+        <div class="sb-modal-foot">
+          <span class="sb-hint grow">有问题就标不合格，重新导入分镜后只重跑这几镜</span>
+          <button class="sb-btn ok" data-player="pass">合格</button>
+          <button class="sb-btn bad" data-player="fail">不合格</button>
+        </div>
+      </div>`;
+    wrap.addEventListener("click", (event) => {
+      if (event.target === wrap) {
+        closePlayer();
+        return;
+      }
+      const button = event.target.closest("[data-player]");
+      if (!button) return;
+      const action = button.dataset.player;
+      if (action === "close") {
+        closePlayer();
+        return;
+      }
+      setVerdict(unitId, action === "pass" ? "pass" : "fail");
+      closePlayer();
+    });
+    root.appendChild(wrap);
+    playerWrap = wrap;
+  }
+
+  /** 记下这一镜的验收结论；不合格的镜下次开自动模式会单独重跑 */
+  function setVerdict(unitId, value) {
+    if (value === "pass" || value === "fail") state.verdict[unitId] = value;
+    else delete state.verdict[unitId];
+    // 标不合格 = 这一镜要重做：取消「已做」，自动模式才会重新应用并排队
+    if (value === "fail") delete state.applied[unitId];
+    persist();
+    renderList();
+    renderProgress();
+    renderOverview();
+    const label = value === "pass" ? "合格" : value === "fail" ? "不合格" : "待检";
+    toast(`${unitId} 已标为${label}`, value === "fail" ? "warn" : "ok");
+  }
+
   /**
    * 让后端把上一镜视频转存到 input/storyboard_ref，返回 VHS 可用的普通路径。
    * 返回 null = 后端不支持这个接口（退回 [output] 方案）；"" = 文件确实不可用。
@@ -2876,7 +3011,8 @@ export function createStoryboardPanel(root, app) {
       units = units.filter((unit) => unit.scene === state.filterScene);
     }
     if (state.hideDone) {
-      units = units.filter((unit) => !state.applied[unit.id]);
+      // 不合格的镜要一直看得见，否则改完提示词就找不到要补哪几镜
+      units = units.filter((unit) => !state.applied[unit.id] || state.verdict[unit.id] === "fail");
     }
     const keyword = state.search.trim().toLowerCase();
     if (keyword) {
@@ -2914,6 +3050,9 @@ export function createStoryboardPanel(root, app) {
   function cardHtml(unit) {
     const expanded = !!state.expanded[unit.id];
     const applied = !!state.applied[unit.id];
+    const verdict = state.verdict[unit.id] === "pass" || state.verdict[unit.id] === "fail" ? state.verdict[unit.id] : "";
+    const shot = state.videos[unit.id];
+    const verdictLabel = verdict === "pass" ? "合格" : verdict === "fail" ? "不合格" : "待检";
     const assets = unit.assets.length
       ? `<div class="sb-tags">${unit.assets
           .map((code) => {
@@ -2952,7 +3091,9 @@ export function createStoryboardPanel(root, app) {
           )}${lastFrame && !firstFrame ? "（缺首帧，规则上不建议开视频）" : ""}</div>`
         : "";
     return `
-      <article class="sb-card sb-tier-${unit.tier} ${applied ? "is-applied" : ""}" data-id="${escapeHtml(unit.id)}">
+      <article class="sb-card sb-tier-${unit.tier} ${applied ? "is-applied" : ""} ${
+        verdict === "pass" ? "is-pass" : verdict === "fail" ? "is-fail" : ""
+      }" data-id="${escapeHtml(unit.id)}">
         <div class="sb-card-head">
           <span class="sb-code">${escapeHtml(unit.id)}</span>
           <span class="sb-tier ${unit.tier}">${unit.tier}</span>
@@ -2965,6 +3106,7 @@ export function createStoryboardPanel(root, app) {
             fight.on ? "开" : "关"
           }（${fight.manual ? "手动" : fight.autoOff ? "自动已关" : "按分镜自动"}），点击切换">武打${fight.manual ? "·手动" : ""}</span>
           <span class="sb-joint ${joint}" title="接点：${JOINT_LABEL[joint]} · ${JOINT_HINT[joint]}">${JOINT_LABEL[joint]}</span>
+          <span class="sb-verdict ${verdict}" data-act="verdict" title="验收：点击切换 待检 → 合格 → 不合格">${verdictLabel}</span>
           <span class="sb-check">${applied ? "✓" : ""}</span>
         </div>
         <div class="sb-zh ${expanded ? "open" : ""}">${escapeHtml(unit.promptZh || "（无中文提示词）")}</div>
@@ -3010,6 +3152,13 @@ export function createStoryboardPanel(root, app) {
         ${libLine}
         ${frameLine}
         ${contLine}
+        ${
+          shot && shot.filename
+            ? `<div class="sb-video"><b>视频</b> ${escapeHtml(shot.filename)}${
+                verdict === "pass" ? " · 合格" : verdict === "fail" ? " · 不合格" : ""
+              }</div>`
+            : ""
+        }
         <div class="sb-params" title="采样器 ${escapeHtml(unit.params?.sampler || "")} / 调度器 ${escapeHtml(
           unit.params?.scheduler || ""
         )} · shift ${escapeHtml(unit.params?.shift ?? "")} · 降噪 ${escapeHtml(
@@ -3018,6 +3167,13 @@ export function createStoryboardPanel(root, app) {
         <div class="sb-actions">
           <button class="sb-btn primary" data-act="all">① 应用这一镜</button>
           <button class="sb-btn" data-act="copy">复制提示词</button>
+          ${
+            shot && shot.filename
+              ? `<button class="sb-btn" data-act="watch">看视频</button>
+                 <button class="sb-btn ok" data-act="pass">合格</button>
+                 <button class="sb-btn bad" data-act="fail">不合格</button>`
+              : ""
+          }
           ${
             prevShot
               ? `<button class="sb-btn" data-act="sample" title="从上一镜输出的最后一帧取图，可拖框裁出局部">${
@@ -3550,9 +3706,27 @@ export function createStoryboardPanel(root, app) {
     el["auto-text"].textContent = text || AUTO_HINT;
   }
 
-  /** 自动模式按文档顺序做，不受搜索/筛选影响 */
+  /**
+   * 自动模式按文档顺序做，不受搜索/筛选影响。
+   * 只要列表里还有「不合格」，就只重跑这几镜；否则做还没做过的。
+   */
   function nextAutoUnit() {
-    return (state.doc ? state.doc.units : []).find((unit) => !state.applied[unit.id]) || null;
+    const units = state.doc ? state.doc.units : [];
+    // 本轮是「只重跑不合格」：范围锁在开跑时那份名单里，跑完就停，不会顺带做别的镜
+    if (autoRetryIds) {
+      return units.find((unit) => autoRetryIds.includes(unit.id) && !state.applied[unit.id]) || null;
+    }
+    const failed = units.filter((unit) => state.verdict[unit.id] === "fail");
+    if (failed.length) return failed.find((unit) => !state.applied[unit.id]) || null;
+    return units.find((unit) => !state.applied[unit.id]) || null;
+  }
+
+  /** 当前自动模式要跑的范围（判断文案用） */
+  function autoScope() {
+    const units = state.doc ? state.doc.units : [];
+    const failed = units.filter((unit) => state.verdict[unit.id] === "fail");
+    if (failed.length) return { mode: "retry", units: failed };
+    return { mode: "fresh", units: units.filter((unit) => !state.applied[unit.id]) };
   }
 
   /** 提交当前画布到队列，返回 prompt_id */
@@ -3745,7 +3919,14 @@ export function createStoryboardPanel(root, app) {
     applying = true;
     el.next.disabled = true;
     if (el.auto) el.auto.checked = true;
-    logLine(`自动模式开始：共 ${state.doc.units.length} 镜，低画质 ${AUTO_MEGAPIXELS}MP`);
+    const scope = autoScope();
+    if (scope.mode === "retry") {
+      const names = scope.units.slice(0, 5).map((unit) => unit.id).join("、");
+      logLine(`自动模式开始：只重跑不合格的 ${scope.units.length} 镜（${names}${scope.units.length > 5 ? "…" : ""}）`);
+    } else {
+      logLine(`自动模式开始：共 ${state.doc.units.length} 镜，低画质 ${AUTO_MEGAPIXELS}MP`);
+    }
+    autoRetryIds = scope.mode === "retry" ? scope.units.map((unit) => unit.id) : null;
     // 低画质：原生 Ref2V 临时降像素档；H3 计划工作流走草稿（10 步 + 半分辨率）
     const before = readResolutionSettings(app);
     const megapixelsBackup = before ? before.megapixels : null;
@@ -3757,6 +3938,11 @@ export function createStoryboardPanel(root, app) {
       while (!autoStopRequested) {
         const unit = nextAutoUnit();
         if (!unit) {
+          if (scope.mode === "retry") {
+            setAutoStatus(`不合格重跑完成：本次重跑 ${done} 镜，回列表复看后标合格/不合格`);
+            toast(`不合格重跑完成：本次 ${done} 镜，记得复看`, "ok");
+            break;
+          }
           // 之前跑过的镜会留在「已做」里，自动模式不会重跑：把数字说清楚
           const total = state.doc.units.length;
           const skipped = Math.max(0, total - done);
@@ -3839,9 +4025,13 @@ export function createStoryboardPanel(root, app) {
         // 记下这一镜的输出视频：下一镜会把它接到 ref_videos（<Video 1>）
         if (finished.videos && finished.videos.length) {
           state.shots[unit.id] = { ...finished.videos[0], at: Date.now() };
+          state.videos[unit.id] = { ...finished.videos[0], at: Date.now() };
         } else {
           delete state.shots[unit.id];
+          delete state.videos[unit.id];
         }
+        // 重跑的不合格镜出了新片：回到「待检」，等人工再验一遍
+        if (state.verdict[unit.id] === "fail") delete state.verdict[unit.id];
         persist();
         // 生成成功才算这一镜完成，避免中途停止时把没出片的镜标成已完成
         markApplied(unit, true);
@@ -3869,12 +4059,16 @@ export function createStoryboardPanel(root, app) {
       toast(`自动模式异常停止：${reason}`, "err");
     } finally {
       autoRunning = false;
+      autoRetryIds = null;
       applying = false;
       if (el.next) el.next.disabled = false;
       if (el.auto) el.auto.checked = false;
       if (megapixelsBackup != null) setResolutionMegapixels(app, megapixelsBackup);
       if (!draftBefore && state.draftBase) finishDraft();
       if (autoStopRequested) setAutoStatus(`已停止（完成 ${done} 镜）`);
+      // 跑完把卡片重画一遍：重跑过的镜要从「不合格」回到「待检」
+      renderList();
+      renderOverview();
       refreshReady();
     }
   }
@@ -3940,11 +4134,21 @@ export function createStoryboardPanel(root, app) {
       logLine("已采用提示词包的全局负向提示词", "ok");
     }
     state.applied = {};
-    // 新一批：上一批的输出视频与衔接帧不再适用，留着会接错片
+    const docIds = new Set(state.doc.units.map((unit) => unit.id));
+    // 旧成片名留着给列表面板回看；接续用的 shots 清空，避免拿上一批的片接本批
+    state.videos = Object.fromEntries(
+      Object.entries(state.videos || {}).filter(([id]) => docIds.has(id))
+    );
     state.shots = {};
     state.continuity = {};
     state.fight = {};
     state.autoNote = "";
+    // 验收结论跨导入保留（改完提示词重导后只重跑不合格）；新包里没有的镜号丢掉
+    state.verdict = Object.fromEntries(
+      Object.entries(state.verdict || {}).filter(([id]) => docIds.has(id))
+    );
+    const failedCount = Object.values(state.verdict).filter((value) => value === "fail").length;
+    if (failedCount) logLine(`导入完成：列表里有 ${failedCount} 镜标了不合格，开自动模式只会重跑这几镜`, "warn");
     // 新分镜：旧的首帧选择和自定义标签都属于上一批素材，清掉避免串用
     const docCodes = new Set();
     state.doc.units.forEach((unit) => (unit.assets || []).forEach((code) => docCodes.add(code)));
@@ -4326,6 +4530,8 @@ export function createStoryboardPanel(root, app) {
     state.raw = "";
     state.doc = null;
     state.applied = {};
+    state.videos = {};
+    state.verdict = {};
     el.text.value = "";
     persist();
     renderAll();
@@ -4659,6 +4865,21 @@ export function createStoryboardPanel(root, app) {
     toast("已刷新首帧图列表");
   });
 
+  // 分镜总清单：行内直接标合格/不合格、点成片名看视频
+  if (el.overview) {
+    el.overview.addEventListener("click", (event) => {
+      const target = event.target.closest("[data-ov]");
+      if (!target) return;
+      const unitId = target.dataset.id;
+      if (!unitId) return;
+      if (target.dataset.ov === "watch") {
+        openShotPlayer(unitId);
+        return;
+      }
+      setVerdict(unitId, target.dataset.ov === "pass" ? "pass" : "fail");
+    });
+  }
+
   el.list.addEventListener("click", async (event) => {
     const button = event.target.closest("[data-act]");
     if (!button) return;
@@ -4689,6 +4910,28 @@ export function createStoryboardPanel(root, app) {
       state.fight[unit.id] = !unitFight(unit).on;
       persist();
       renderList();
+      return;
+    }
+
+    if (act === "watch") {
+      openShotPlayer(unit.id);
+      return;
+    }
+
+    if (act === "pass") {
+      setVerdict(unit.id, "pass");
+      return;
+    }
+
+    if (act === "fail") {
+      setVerdict(unit.id, "fail");
+      return;
+    }
+
+    if (act === "verdict") {
+      // 待检 → 合格 → 不合格 → 待检
+      const current = state.verdict[unit.id];
+      setVerdict(unit.id, current === "pass" ? "fail" : current === "fail" ? "" : "pass");
       return;
     }
 
