@@ -5,7 +5,7 @@
 const TEXT_WIDGETS = ["text", "prompt", "string"];
 
 /** 桥接模块构建号：面板徽标里一起显示，用来确认浏览器加载的是新代码 */
-export const BRIDGE_BUILD = "20261113e";
+export const BRIDGE_BUILD = "20261117h";
 
 /** 只返回真正参与执行的工作流节点（排除静音 mode 2 与旁路 mode 4） */
 export function getNodes(app) {
@@ -2229,6 +2229,9 @@ export function applyUnitParams(app, unit, settings, targets, options = {}) {
     } else {
       missing.push("时长");
     }
+    // 时长由这条工作流自己的控件换算帧数，面板不写帧；帧率仍要是 24，否则音频时钟会漂
+    const fpsFixed = ensureH3Fps(app);
+    if (fpsFixed.length) pushDone(`帧率修正为 24（节点 ${fpsFixed.join("、")}）`);
     // 画面比例按分镜档位的宽高算，像素默认锁 1.5MP；自动模式会传更低的档
     const lockMegapixels = Number(options.megapixels) > 0 ? Number(options.megapixels) : H3_MEGAPIXELS;
     const resolution = writeResolution(app, params.width, params.height, lockMegapixels);
@@ -2257,7 +2260,8 @@ export function applyUnitParams(app, unit, settings, targets, options = {}) {
       tuned: true,
       model: guarded.profile ? guarded.profile.key : "",
       modelName: guarded.profile ? guarded.profile.name : "",
-      adjusted: guarded.changes,
+      // 这条工作流不写帧数，帧率也有专门的修正提示，两项都不重复报
+      adjusted: guarded.changes.filter((item) => !/^(?:帧数|帧率)/.test(item)),
     };
   }
 

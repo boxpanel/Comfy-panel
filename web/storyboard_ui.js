@@ -13,7 +13,7 @@ import {
   parseFrameName,
   parseStoryboard,
   summarize,
-} from "./storyboard_parser.js?v=20261117e";
+} from "./storyboard_parser.js?v=20261117g";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -66,11 +66,11 @@ import {
   writePlanPromptPrefix,
   writeRuleBridgeText,
   writeH3Shot,
-} from "./storyboard_bridge.js?v=20261113e";
+} from "./storyboard_bridge.js?v=20261117h";
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
-const PANEL_VERSION = `v53.30 · 接点 · ${BRIDGE_BUILD}`;
+const PANEL_VERSION = `v53.32 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -1518,6 +1518,50 @@ export function createStoryboardPanel(root, app) {
       });
   }
 
+  /** 从「对白／音效」栏拆出台词：说话人 + 原句。台词保持原文，用来锁定口型和语言 */
+  function unitDialogueLines(unit) {
+    const raw = String((unit && (unit.audio || unit.dialogueText)) || "");
+    if (!raw) return [];
+    const out = [];
+    const push = (speaker, text) => {
+      const line = String(text || "").replace(/\s+/g, " ").trim();
+      // 「雪杖绷紧「格」声」这类拟声不是台词
+      if (line.length < 3) return;
+      if (out.some((item) => item.text === line)) return;
+      const who = String(speaker || "")
+        .replace(/^(?:对白|音效|对白／音效|声音|台词)\s*$/, "")
+        .trim();
+      if (/音效|环境声|环境音|拟声/.test(who)) return;
+      out.push({ speaker: who, text: line });
+    };
+    // 带音频模型的包写成 <d>[Chinese] 台词</d>
+    const tagged = /<d>\s*(?:\[[^\]]*\])?\s*([\s\S]*?)<\/d>/gi;
+    let match;
+    while ((match = tagged.exec(raw))) {
+      const body = String(match[1] || "").trim();
+      const split = body.match(/^([^：:，,。]{1,12})[：:]\s*(.+)$/);
+      push(split ? split[1] : "", split ? split[2] : body);
+    }
+    if (!out.length) {
+      // 说话人：「台词」
+      const quoted = /([^：:；;。，,\s]{1,12})?\s*[：:]?\s*「([^」]{1,300})」/g;
+      while ((match = quoted.exec(raw))) push(match[1] || "", match[2]);
+    }
+    return out;
+  }
+
+  /** 整片台词是不是中文（缓存：同一份文档只扫一遍） */
+  let speaksChineseCache = { doc: null, value: false };
+  function docSpeaksChinese() {
+    if (!state.doc) return false;
+    if (speaksChineseCache.doc === state.doc) return speaksChineseCache.value;
+    const value = state.doc.units.some((unit) =>
+      unitDialogueLines(unit).some((item) => /[\u4e00-\u9fff]/.test(item.text))
+    );
+    speaksChineseCache = { doc: state.doc, value };
+    return value;
+  }
+
   /** H3 计划里的提示词：只写英文正文（中文留在面板里对照），音效单列一段 */
   function buildPlanPrompt(unit, video = null) {
     const text = String(unit.promptEn || "").trim() || String(unit.promptZh || "").trim();
@@ -1525,6 +1569,7 @@ export function createStoryboardPanel(root, app) {
     // 音效只有中文时：默认照原样写入；勾选「音效段跳过中文」后写纯英文提示词
     const soundUsable = sound && !(settings().dropCnSound && /[\u4e00-\u9fff]/.test(sound));
     const tags = planReferenceTags(unit);
+    const spoken = unitDialogueLines(unit);
     const lines = ["detailed_description:", text];
     if (tags.length) {
       lines.push("", `Reference pictures: ${tags.map((tag) => `@${tag}`).join(" ")}.`);
@@ -1577,6 +1622,21 @@ export function createStoryboardPanel(root, app) {
           (pick, index) =>
             `<Audio ${index + 1}> is the voice-timbre reference ${pick.code || pick.entry.name}: keep the vocal identity and timbre only; do not copy its original dialogue or background sound.`
         )
+      );
+    }
+    // 台词必须写进提示词，否则 H3 会照着英文画面描述随口编英语人声
+    const mandarin = spoken.some((item) => /[\u4e00-\u9fff]/.test(item.text)) || docSpeaksChinese();
+    if (spoken.length) {
+      lines.push("", "dialogue:", ...spoken.map((item) => `${item.speaker ? `${item.speaker}：“` : "“"}${item.text}”`));
+    } else {
+      lines.push("", "dialogue:", "No spoken dialogue in this shot.");
+    }
+    if (mandarin) {
+      lines.push(
+        "",
+        spoken.length
+          ? "Spoken language: Mandarin Chinese (普通话). Say the lines above in Chinese exactly as written; do not translate them into English."
+          : "Spoken language: Mandarin Chinese (普通话); no English speech or narration."
       );
     }
     if (soundUsable) lines.push("", "overall_soundscape:", sound);
@@ -2603,11 +2663,34 @@ export function createStoryboardPanel(root, app) {
     persist();
   }
 
+  /** ComfyUI input 目录里是否已经有这个文件（重选素材库后 uploadedName 被清空，但文件其实还在服务器上） */
+  async function inputFileExists(name) {
+    if (!name) return false;
+    const query = new URLSearchParams({ filename: name, type: "input", subfolder: "" });
+    const url = typeof api.apiURL === "function" ? api.apiURL(`/view?${query.toString()}`) : `/view?${query}`;
+    try {
+      const response = await fetch(url, { method: "HEAD", cache: "no-store" });
+      return response.ok;
+    } catch (error) {
+      return false;
+    }
+  }
+
   async function uploadAsset(entry, persistNow = true) {
     if (entry.uploadedName) return entry.uploadedName;
     if (!entry.image && !entry.audio) return null;
     let file = fileHandles.get(entry.path);
     if (!file) {
+      // 刷新页面后拿不到文件句柄：先看服务器 input 里是否已有同名文件，有就直接沿用
+      if (!(entry.image && settings().cutout) && (await inputFileExists(entry.name))) {
+        entry.uploadedName = entry.name;
+        entry.uploadError = "";
+        if (persistNow) {
+          saveLibraryStore();
+          persist();
+        }
+        return entry.name;
+      }
       entry.uploadError = "本次会话没有这个文件（刷新/切页后要重新点「素材库」选文件夹）";
       return null;
     }
@@ -3604,6 +3687,39 @@ export function createStoryboardPanel(root, app) {
     return { ok: false, message: "已停止", videos: [] };
   }
 
+  /** 自动模式开跑前核对：本片要用的素材，是不是都能上传（有句柄 / 已上传 / 服务器 input 里已有） */
+  async function missingAssetEntries() {
+    const codes = new Set();
+    const ids = new Set();
+    for (const unit of state.doc.units) {
+      (unit.assets || []).forEach((code) => codes.add(canonicalCode(code)));
+      ids.add(unit.id);
+    }
+    const candidates = libraryFiles().filter((entry) => {
+      if (!(entry.image || entry.audio)) return false;
+      if (entry.uploadedName || fileHandles.has(entry.path)) return false;
+      const byCode = (entry.codes || []).some((code) => codes.has(canonicalCode(code)));
+      const byUnit = (entry.units || []).some((id) => ids.has(id));
+      return byCode || byUnit;
+    });
+    const missing = [];
+    let adopted = 0;
+    for (const entry of candidates) {
+      if (!(entry.image && settings().cutout) && (await inputFileExists(entry.name))) {
+        entry.uploadedName = entry.name;
+        adopted += 1;
+        continue;
+      }
+      missing.push(entry);
+    }
+    if (adopted) {
+      saveLibraryStore();
+      persist();
+      logLine(`素材核对：服务器 input 里已有 ${adopted} 个文件，直接沿用，不用重传`);
+    }
+    return missing;
+  }
+
   async function runAuto() {
     if (!state.doc || !state.doc.units.length) {
       if (el.auto) el.auto.checked = false;
@@ -3611,6 +3727,19 @@ export function createStoryboardPanel(root, app) {
       return;
     }
     if (autoRunning) return;
+    // 素材拿不到就开跑，第一镜必定写入失败，先把原因说清楚
+    const missing = await missingAssetEntries();
+    if (missing.length) {
+      const names = missing.slice(0, 3).map((entry) => entry.name).join("、");
+      const reason = `自动模式未开始：${missing.length} 个素材文件不在本次会话（${names}${
+        missing.length > 3 ? "…" : ""
+      }）。点顶部「素材库」重新选一次文件夹，再开自动模式。`;
+      if (el.auto) el.auto.checked = false;
+      setAutoStatus(reason);
+      logLine(reason, "err");
+      toast(`还有 ${missing.length} 个素材没进 ComfyUI：重新点「素材库」选文件夹后再开自动模式`, "err");
+      return;
+    }
     autoRunning = true;
     autoStopRequested = false;
     applying = true;
@@ -3642,10 +3771,11 @@ export function createStoryboardPanel(root, app) {
         setAutoStatus(`第 ${done + 1} 镜：${unit.id} 写入中…`);
         const result = await applyUnitCore(unit, { megapixels: AUTO_MEGAPIXELS });
         if (!result.ok) {
-          setCardMessage(unit, result.detail, "err");
-          setAutoStatus(`停在 ${unit.id}：${result.detail}`);
-          toast(`${unit.id} 写入失败，自动模式已停止`, "err");
-          console.error(`[分镜面板] ${unit.id} 写入失败：${result.detail}`);
+          const reason = String(result.detail || "").trim() || "原因未知，看浏览器控制台";
+          setCardMessage(unit, reason, "err");
+          setAutoStatus(`停在 ${unit.id}：${reason}`);
+          logLine(`${unit.id} 写入失败：${reason}`, "err");
+          toast(`${unit.id} 写入失败：${reason.slice(0, 140)}`, "err");
           break;
         }
         setCardMessage(unit, result.detail, "ok");
@@ -3686,7 +3816,7 @@ export function createStoryboardPanel(root, app) {
           if (autoStopRequested) break;
           setAutoStatus(`排队失败：${queued.message}`);
           toast(`排队失败：${queued.message}`, "err");
-          console.error(`[分镜面板] ${unit.id} 排队失败：${queued.message}`);
+          logLine(`${unit.id} 排队失败：${queued.message}`, "err");
           break;
         }
         logLine(`${unit.id} 已排队：${queued.promptId}`);
@@ -3702,7 +3832,7 @@ export function createStoryboardPanel(root, app) {
           if (!autoStopRequested) {
             setAutoStatus(`${unit.id} 生成失败：${finished.message}`);
             toast(`${unit.id} 生成失败，自动模式已停止`, "err");
-            console.error(`[分镜面板] ${unit.id} 生成失败：${finished.message}`);
+            logLine(`${unit.id} 生成失败：${finished.message}`, "err");
           }
           break;
         }
