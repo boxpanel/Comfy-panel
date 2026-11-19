@@ -386,7 +386,10 @@ function injectStyle() {
 const FIGHT_VIOLENT_RE =
   /拳|踢|踹|搏斗|格斗|打斗|扭打|厮打|扑倒|扑上来|扑住|按倒|被打|打倒|推倒|摔倒|压倒|掐|拖拽|抢夺|抢过|抢走|抢袋|夺下|耳光|殴打|击打|揍|锁喉|杖击|棍击/g;
 const FIGHT_CONTACT_RE = /抓|按|推|撞|挥|拉|扯/g;
-const FIGHT_EN_RE = /\b(punch|kick|grapple|wrestle|tackle|combat|melee|brawl|scuffle)\b/gi;
+// 英文打斗动作词：只收明确的肢体冲突；strike / slam / attack / fist 在灯光、雨声、
+// 摔门、握拳里也会出现，不能单独作为开武打 LoRA 的依据
+const FIGHT_EN_RE =
+  /\b(punch(?:es|ed|ing)?|kick(?:s|ed|ing)?|grapple[ds]?|wrestl(?:e|es|ed|ing)|tackl(?:e|es|ed|ing)|combat|melee|brawl(?:s|ing)?|scuffle[ds]?|fight(?:s|ing)?|slap(?:s|ped|ping)?|shove[ds]?|shoving|choke[ds]?|choking|strangl(?:e|es|ed|ing)|uppercut(?:s|ed|ing)?|headbutt(?:s|ed|ing)?|fistfight(?:s|ing)?|pistol[- ]whip(?:s|ped|ping)?)\b/gi;
 // 「抱拳」「拳头大的石头」「抢话」「不抢到他前面」不是打斗
 const FIGHT_NOISE_RE = /抱拳|拳头大|抢话|抢到|抢先|抢救|抢修/g;
 // 只看 主体/画面/动作 三段：运镜「推」、光「打在」会污染判断
@@ -1129,11 +1132,16 @@ export function createStoryboardPanel(root, app) {
     });
   }
 
-  /** 本镜要用的参考音频：先按素材列顺序，再按镜号命中 */
+  /** 本镜要用的参考音频：先按素材列顺序，再按音色绑定（V-xx），最后按镜号命中 */
   function unitAudioPicks(unit) {
     const picks = [];
     const seen = new Set();
-    for (const code of unit.assets || []) {
+    // 六段式单元包把音色写在「- 音色绑定：」里（V-01 这类编号），不在素材列
+    const codes = [
+      ...(unit.assets || []),
+      ...((unit.audioRefs || []).map((item) => item.code).filter(Boolean)),
+    ];
+    for (const code of codes) {
       for (const entry of libraryFiles()) {
         if (!entry.audio || seen.has(entry.path)) continue;
         if (!entryHasCode(entry, code)) continue;
@@ -1630,26 +1638,30 @@ export function createStoryboardPanel(root, app) {
     const sound = String(unit.soundscape || "").trim();
     // 音效只有中文时：默认照原样写入；勾选「音效段跳过中文」后写纯英文提示词
     const soundUsable = sound && !(settings().dropCnSound && /[\u4e00-\u9fff]/.test(sound));
-    const tags = planReferenceTags(unit);
+    // 六段式单元包：正文已经带 subject_definitions / summary / 音效段，原样写入，不再补段落
+    const structured = !!unit.structuredPrompt;
+    const tags = structured ? [] : planReferenceTags(unit);
     const spoken = unitDialogueLines(unit);
-    const lines = ["detailed_description:", text];
-    if (tags.length) {
-      lines.push("", `Reference pictures: ${tags.map((tag) => `@${tag}`).join(" ")}.`);
-    } else {
-      // 原生 Ref2V：按参考位顺序写明每张图的用途，保持英文
-      const bindings = unitPictureBindings(unit, "en");
-      if (bindings.length && !/<Picture\s+1>/i.test(text)) lines.push("", ...bindings);
-    }
-    // 手动从上一镜末帧取的图排在参考图最后一位
-    const extra = continuityPick(unit);
-    if (extra) {
-      const index = unitReferenceCodes(unit).length + 1;
-      lines.push(
-        "",
-        `<Picture ${index}> is ${extra.cropped ? "a cropped detail" : "the last frame"} from the previous shot ${
-          extra.code || ""
-        }: use it only for the same wardrobe, props, materials, colour and wear; it does not define this shot's framing or background.`
-      );
+    const lines = structured ? [text] : ["detailed_description:", text];
+    if (!structured) {
+      if (tags.length) {
+        lines.push("", `Reference pictures: ${tags.map((tag) => `@${tag}`).join(" ")}.`);
+      } else {
+        // 原生 Ref2V：按参考位顺序写明每张图的用途，保持英文
+        const bindings = unitPictureBindings(unit, "en");
+        if (bindings.length && !/<Picture\s+1>/i.test(text)) lines.push("", ...bindings);
+      }
+      // 手动从上一镜末帧取的图排在参考图最后一位
+      const extra = continuityPick(unit);
+      if (extra) {
+        const index = unitReferenceCodes(unit).length + 1;
+        lines.push(
+          "",
+          `<Picture ${index}> is ${extra.cropped ? "a cropped detail" : "the last frame"} from the previous shot ${
+            extra.code || ""
+          }: use it only for the same wardrobe, props, materials, colour and wear; it does not define this shot's framing or background.`
+        );
+      }
     }
     // 跨镜衔接：上一镜视频接在 ref_videos.ref_video_0
     const joint = unitJoint(unit);
@@ -1669,40 +1681,42 @@ export function createStoryboardPanel(root, app) {
         );
       }
     }
-    if (joint === "hard") {
-      lines.push(
-        "",
-        "Do not carry over any frame, composition or lighting layout from the previous shot; rebuild the space, blocking and light from the reference pictures only."
-      );
+    if (!structured) {
+      if (joint === "hard") {
+        lines.push(
+          "",
+          "Do not carry over any frame, composition or lighting layout from the previous shot; rebuild the space, blocking and light from the reference pictures only."
+        );
+      }
+      // 原生 Ref2V 的参考音频按 ref_audios 顺序编号，提示词里要说清「只要音色」
+      const audioPicks = unitAudioPicks(unit);
+      if (audioPicks.length && !/<Audio\s+1>/i.test(text)) {
+        lines.push(
+          "",
+          ...audioPicks.slice(0, 3).map(
+            (pick, index) =>
+              `<Audio ${index + 1}> is the voice-timbre reference ${pick.code || pick.entry.name}: keep the vocal identity and timbre only; do not copy its original dialogue or background sound.`
+          )
+        );
+      }
+      // 台词必须写进提示词，否则 H3 会照着英文画面描述随口编英语人声
+      const mandarin = spoken.some((item) => /[\u4e00-\u9fff]/.test(item.text)) || docSpeaksChinese();
+      if (spoken.length) {
+        lines.push("", "dialogue:", ...spoken.map((item) => `${item.speaker ? `${item.speaker}：“` : "“"}${item.text}”`));
+      } else {
+        lines.push("", "dialogue:", "No spoken dialogue in this shot.");
+      }
+      if (mandarin) {
+        lines.push(
+          "",
+          spoken.length
+            ? "Spoken language: Mandarin Chinese (普通话). Say the lines above in Chinese exactly as written; do not translate them into English."
+            : "Spoken language: Mandarin Chinese (普通话); no English speech or narration."
+        );
+      }
+      if (soundUsable) lines.push("", "overall_soundscape:", sound);
+      lines.push("", "non_diegetic_music:", "No non-diegetic music.");
     }
-    // 原生 Ref2V 的参考音频按 ref_audios 顺序编号，提示词里要说清「只要音色」
-    const audioPicks = unitAudioPicks(unit);
-    if (audioPicks.length && !/<Audio\s+1>/i.test(text)) {
-      lines.push(
-        "",
-        ...audioPicks.slice(0, 3).map(
-          (pick, index) =>
-            `<Audio ${index + 1}> is the voice-timbre reference ${pick.code || pick.entry.name}: keep the vocal identity and timbre only; do not copy its original dialogue or background sound.`
-        )
-      );
-    }
-    // 台词必须写进提示词，否则 H3 会照着英文画面描述随口编英语人声
-    const mandarin = spoken.some((item) => /[\u4e00-\u9fff]/.test(item.text)) || docSpeaksChinese();
-    if (spoken.length) {
-      lines.push("", "dialogue:", ...spoken.map((item) => `${item.speaker ? `${item.speaker}：“` : "“"}${item.text}”`));
-    } else {
-      lines.push("", "dialogue:", "No spoken dialogue in this shot.");
-    }
-    if (mandarin) {
-      lines.push(
-        "",
-        spoken.length
-          ? "Spoken language: Mandarin Chinese (普通话). Say the lines above in Chinese exactly as written; do not translate them into English."
-          : "Spoken language: Mandarin Chinese (普通话); no English speech or narration."
-      );
-    }
-    if (soundUsable) lines.push("", "overall_soundscape:", sound);
-    lines.push("", "non_diegetic_music:", "No non-diegetic music.");
     return lines.join("\n");
   }
 
@@ -3032,7 +3046,8 @@ export function createStoryboardPanel(root, app) {
     // H3 的帧数按 24fps 落到 17k+5 网格，这里显示实际会写入的帧数
     const isH3 = !!findH3PlanNode(app);
     const seconds = Number(unit.duration) > 0 ? Number(unit.duration) : params.frames / (params.fps || 16);
-    const frames = isH3 ? alignedFrames(seconds) : params.frames;
+    // 交付稿已给出 17k+5 的帧数就直接用，没有才按秒数换算
+    const frames = Number(unit.frames) > 0 ? Number(unit.frames) : isH3 ? alignedFrames(seconds) : params.frames;
     const parts = [
       params.name,
       `${duration}（生成 ${frames} 帧${isH3 ? " · 24fps" : ""}）`,
@@ -3373,7 +3388,7 @@ export function createStoryboardPanel(root, app) {
         Number(unit.duration) > 0
           ? Number(unit.duration)
           : Number(unit.params.frames) / (Number(unit.params.fps) || 16);
-      const frames = alignedFrames(seconds);
+      const frames = Number(unit.frames) > 0 ? Number(unit.frames) : alignedFrames(seconds);
       const steps = unit.params.steps;
       const result = writeH3Shot(app, target, { steps, seed: String(seed), length: frames });
       if (!result.ok) return { ok: false, message: result.message };
@@ -3867,6 +3882,10 @@ export function createStoryboardPanel(root, app) {
     const ids = new Set();
     for (const unit of state.doc.units) {
       (unit.assets || []).forEach((code) => codes.add(canonicalCode(code)));
+      // 六段式单元包的参考音频写在「音色绑定」里（V-01），也算本片要用的素材
+      (unit.audioRefs || []).forEach((ref) => {
+        if (ref.code) codes.add(canonicalCode(ref.code));
+      });
       ids.add(unit.id);
     }
     const candidates = libraryFiles().filter((entry) => {
@@ -4215,7 +4234,7 @@ export function createStoryboardPanel(root, app) {
   }
 
   // 提示词包里的三类镜表 + 几张附表，按内容认；文件名前缀作兜底（00~09 是出包端固定编号）
-  const PACK_KIND_LABEL = { json: "08 JSON", csv: "06 CSV", txt: "04 TXT", shots: "01 分镜", assets: "03 素材", frames: "02 首尾帧" };
+  const PACK_KIND_LABEL = { units: "11 单元稿", json: "08 JSON", csv: "06 CSV", txt: "04 TXT", shots: "01 分镜", assets: "03 素材", frames: "02 首尾帧" };
   const PACK_FILE_KIND = {
     "00": "doc",
     "01": "shots",
@@ -4346,6 +4365,8 @@ export function createStoryboardPanel(root, app) {
     const head = String(text || "").slice(0, 6000);
     const prefix = (String(name || "").match(/^(\d{2})[-_. ]/) || [])[1];
     if (prefix && PACK_FILE_KIND[prefix]) return PACK_FILE_KIND[prefix];
+    // 标准工作流单元稿（169 条六段式）：优先当主源，别让样张的「## 镜头 01」抢走
+    if (/^##\s+U\d{3}\s*[·・]\s*镜头/m.test(head) && /^subject_definitions:\s*$/m.test(head)) return "units";
     if (/\.json$/i.test(lower) || /^\uFEFF?\s*\{/.test(head)) return "json";
     if (/\.csv$/i.test(lower) || (/镜头号/.test(head.split(/\r?\n/, 1)[0] || "") && head.includes(","))) return "csv";
     if (/【镜头\s*\d+】/.test(head)) return "txt";
@@ -4420,7 +4441,7 @@ export function createStoryboardPanel(root, app) {
       return;
     }
 
-    const primaryOrder = ["json", "csv", "txt", "shots"];
+    const primaryOrder = ["units", "json", "csv", "txt", "shots"];
     const primary = primaryOrder.map((kind) => usable.find((entry) => entry.kind === kind)).find(Boolean);
     const main = primary || usable[0];
     if (!main) return;
@@ -4456,7 +4477,15 @@ export function createStoryboardPanel(root, app) {
       const existing = state.doc.assetNames || {};
       const added = Object.keys(names).filter((code) => !existing[code]);
       if (Object.keys(names).length) {
-        state.doc.assetNames = { ...names, ...existing };
+        const merged = { ...names, ...existing };
+        // 六段式正文里场景/道具只有英文名；03 有中文名时以中文为准
+        Object.keys(names).forEach((code) => {
+          const oldName = existing[code];
+          if (oldName && !/[\u4e00-\u9fff]/.test(oldName) && /[\u4e00-\u9fff]/.test(names[code])) {
+            merged[code] = names[code];
+          }
+        });
+        state.doc.assetNames = merged;
         logLine(`已从 03 素材表读入 ${Object.keys(names).length} 条名称（新增 ${added.length} 条）`, "ok");
         renderList();
       }

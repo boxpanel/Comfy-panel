@@ -62,8 +62,10 @@ const TIER_DEFAULTS = {
   },
 };
 
-// 素材编号：S 角色 / C 服装 / P 道具 / E 场景 / ST 风格 / A 其他，兼容旧的 R / T / G / T-P
-const ASSET_RE = /\b(?:ST|T-P|T|R|C|S|P|G|E|A)-\d{2}[a-zA-Z]?(?:-E\d)?\b/g;
+// 素材编号：S 角色 / C 服装 / P 道具 / E 场景 / ST 风格 / A 其他，兼容旧的 R / T / G / T-P；
+// V / RA 是参考音频（音色绑定）的编号。
+// 边界不能用 \b：素材文件名是 S-01_sheet_v01.png / E-01_ref_v01.png，下划线也是单词字符
+const ASSET_RE = /(?<![A-Za-z0-9])(?:ST|T-P|T|RA|R|C|S|P|G|E|A|V)-\d{2}[a-zA-Z]?(?:-E\d)?(?![A-Za-z0-9])/gi;
 
 /** 统一素材编号大小写：s-04a -> S-04a，t-p01 -> T-P01 */
 export function normalizeAssetCode(code) {
@@ -484,7 +486,7 @@ function extractAssets(text) {
   return found;
 }
 
-const ASSET_CODE_PATTERN = "(?:ST|T-P|T|R|C|S|P|G|E|A)-\\d{2}[a-zA-Z]?(?:-E\\d)?";
+const ASSET_CODE_PATTERN = "(?:ST|T-P|T|RA|R|C|S|P|G|E|A|V)-\\d{2}[a-zA-Z]?(?:-E\\d)?";
 
 /**
  * 从手册里抽「素材编号 → 中文名」对照表。
@@ -539,12 +541,303 @@ export function parseAssetNames(text) {
   return names;
 }
 
+// ---------- 标准工作流单元提示词（六段式） ----------
+// 出包端格式：## U001 · 镜头 01—04
+//   - 场景：… ｜ 镜数：4 ｜ 名义 20s ｜ 对齐 481 帧 = 20.042s
+//   - 素材绑定：<Picture 1> S-01、<Picture 2> S-06
+//   - 音色绑定：<Audio 1> S1 卫斯理（V-01）
+//   ```text
+//   subject_definitions: … / summary: [reference generation + audio reference] … / …
+//   ```
+const PROMPT_SECTIONS = [
+  "subject_definitions",
+  "summary",
+  "retention_analysis",
+  "detailed_description",
+  "overall_soundscape",
+  "non_diegetic_music",
+];
+// summary 前缀：纯参考图生成，或参考图 + 音色参考
+const SUMMARY_PREFIX_RE = /^\[reference generation(?:\s*\+\s*audio reference)?\]\s*/i;
+const STRUCT_CODE_RE = "(?:ST|T-P|T|RA|R|C|S|P|G|E|A|V)-\\d{2}[a-zA-Z]?(?:-E\\d)?";
+
+/** 六段式正文 → { subject_definitions, summary, … } */
+function promptSectionsOf(body) {
+  const marks = [];
+  const re = new RegExp(`^(${PROMPT_SECTIONS.join("|")}):\\s*$`, "gm");
+  let match;
+  while ((match = re.exec(body))) {
+    marks.push({ key: match[1], start: match.index, end: match.index + match[0].length });
+  }
+  const sections = {};
+  marks.forEach((mark, index) => {
+    const stop = index + 1 < marks.length ? marks[index + 1].start : body.length;
+    sections[mark.key] = body.slice(mark.end, stop).trim();
+  });
+  return sections;
+}
+
+/** 素材绑定：`<Picture 1> S-01` 与 `S-01 卫斯理（Picture 1）` 两种写法 */
+function parsePictureBindings(line) {
+  const found = [];
+  let match;
+  const direct = new RegExp(`<Picture\\s+(\\d+)>\\s*(${STRUCT_CODE_RE})`, "gi");
+  while ((match = direct.exec(line))) {
+    found.push({ picture: Number(match[1]), code: normalizeAssetCode(match[2]) });
+  }
+  if (!found.length) {
+    const trailing = new RegExp(`(${STRUCT_CODE_RE})\\s*[^、，,（(]*[（(]\\s*Picture\\s+(\\d+)\\s*[）)]`, "gi");
+    while ((match = trailing.exec(line))) {
+      found.push({ picture: Number(match[2]), code: normalizeAssetCode(match[1]) });
+    }
+  }
+  return found.sort((a, b) => a.picture - b.picture);
+}
+
+/** 音色绑定：`<Audio 1> S1 卫斯理（V-01）` → 音频槽 / 说话人 / 名称 / 参考音频编号 */
+function parseVoiceBindings(line) {
+  const found = [];
+  const re = /<Audio\s+(\d+)>\s*(?:(S\d+)\s*)?([^、，,（(<>\n]*?)\s*(?:[（(]\s*((?:V|RA)-\d{1,2})\s*[）)])?(?=[、，,]|$)/gi;
+  let match;
+  while ((match = re.exec(line))) {
+    found.push({
+      audio: Number(match[1]),
+      speaker: String(match[2] || "").toUpperCase(),
+      name: String(match[3] || "").trim(),
+      code: match[4] ? normalizeAssetCode(match[4]) : "",
+    });
+  }
+  return found;
+}
+
+/** subject_definitions 里的 `<Audio N> … <Subject M> (S#)` 定义 */
+function parseAudioDefinitions(section) {
+  const found = [];
+  const re = /<Audio\s+(\d+)>[^\n]*?<Subject\s+(\d+)>[^\n]*?\((S\d+)\)/gi;
+  let match;
+  while ((match = re.exec(String(section || "")))) {
+    found.push({ audio: Number(match[1]), subject: Number(match[2]), speaker: match[3].toUpperCase() });
+  }
+  return found;
+}
+
+/** retention_analysis 里的 RA 行：`<Audio N>: reference - …` */
+function parseAudioRetention(section) {
+  const found = [];
+  const re = /^<Audio\s+(\d+)>\s*:\s*([^\n]+)$/gmi;
+  let match;
+  while ((match = re.exec(String(section || "")))) {
+    found.push({ audio: Number(match[1]), text: match[2].trim() });
+  }
+  return found;
+}
+
+/** subject_definitions 里的 `<Subject N> … from <Picture K>` */
+function parseSubjectDefinitions(section) {
+  const found = [];
+  const re = /^<Subject\s+(\d+)>\s+is\s+([^\n,]+?)(?:\s*\(([^)]*)\))?\s+from\s+<Picture\s+(\d+)>/gmi;
+  let match;
+  while ((match = re.exec(String(section || "")))) {
+    found.push({
+      subject: Number(match[1]),
+      enName: match[2].trim(),
+      name: (match[3] || match[2]).trim(),
+      picture: Number(match[4]),
+    });
+  }
+  return found;
+}
+
+/** 合并音色绑定、定义与 RA 行，按 <Audio N> 排序 */
+function mergeAudioRefs(voice, defs, retention) {
+  const map = new Map();
+  const bucket = (audio) => {
+    if (!map.has(audio)) {
+      map.set(audio, { audio, speaker: "", name: "", code: "", subject: 0, retention: "" });
+    }
+    return map.get(audio);
+  };
+  const absorb = (item) => {
+    const target = bucket(item.audio);
+    Object.keys(item).forEach((key) => {
+      if (item[key] !== "" && item[key] !== 0 && item[key] != null) target[key] = item[key];
+    });
+  };
+  defs.forEach(absorb);
+  voice.forEach(absorb);
+  retention.forEach((item) => {
+    bucket(item.audio).retention = item.text;
+  });
+  return Array.from(map.values()).sort((a, b) => a.audio - b.audio);
+}
+
+/** 结构化成片提示词（单元包 / 样张）→ 与旧手册相同的 doc 结构 */
+function parseStructuredPromptPack(text) {
+  const unitHeads = [];
+  let match;
+  const unitRe = /^##\s+(U\d{3})\s*[·・]\s*镜头\s*(\d+)\s*[—–-]\s*(\d+)\s*$/gm;
+  while ((match = unitRe.exec(text))) {
+    unitHeads.push({
+      index: match.index,
+      end: match.index + match[0].length,
+      uid: match[1],
+      from: Number(match[2]),
+      to: Number(match[3]),
+    });
+  }
+  if (!unitHeads.length) {
+    const shotRe = /^##\s+镜头\s*(\d+)\s*(?:[（(]([^）)]*)[）)])?\s*$/gm;
+    while ((match = shotRe.exec(text))) {
+      const heading = parseUnitHeading(match[0]);
+      if (!heading) continue;
+      unitHeads.push({
+        index: match.index,
+        end: match.index + match[0].length,
+        uid: heading.id,
+        from: Number(match[1]),
+        to: Number(match[1]),
+        heading,
+        tail: match[2] || "",
+      });
+    }
+  }
+  if (!unitHeads.length) return null;
+
+  const tiers = cloneTierDefaults();
+  const titleMatch = text.match(/^#\s+(.+)$/m);
+  const title = titleMatch ? titleMatch[1].trim() : "标准工作流单元提示词";
+  const scene = { no: 1, name: title, note: "", units: [] };
+  const units = [];
+  const warnings = [];
+  // 素材编号 → 名称：从 subject_definitions 反推（有中文用中文，没有就用英文名）
+  const assetNames = {};
+
+  unitHeads.forEach((head, index) => {
+    const stop = index + 1 < unitHeads.length ? unitHeads[index + 1].index : text.length;
+    const block = text.slice(head.end, stop);
+    const fence = block.match(/```(?:text)?\s*\n([\s\S]*?)```/);
+    const body = (fence ? fence[1] : block).trim();
+    const sections = promptSectionsOf(body);
+
+    const meta = block.match(
+      /^[-*]?\s*场景[：:]\s*(.+?)\s*[｜|]\s*镜数[：:]\s*(\d+)\s*[｜|]\s*名义\s*(\d+(?:\.\d+)?)\s*s\s*[｜|]\s*对齐\s*(\d+)\s*帧\s*=\s*([\d.]+)\s*s/m
+    );
+    const bind = block.match(/^[-*]?\s*(?:素材绑定|素材)[：:]\s*(.+)$/m);
+    const voice = block.match(/^[-*]?\s*音色绑定[：:]\s*(.+)$/m);
+
+    let nominal = meta ? Number(meta[3]) : 0;
+    if (!nominal && head.tail) {
+      const first = head.tail.match(/^(\d+(?:\.\d+)?)\s*(?:s|秒)/i);
+      if (first) nominal = Number(first[1]);
+    }
+
+    const pictures = bind ? parsePictureBindings(bind[1]) : [];
+    const subjects = parseSubjectDefinitions(sections.subject_definitions);
+    pictures.forEach((pic) => {
+      const subject = subjects.find((item) => item.picture === pic.picture);
+      if (!subject || assetNames[pic.code]) return;
+      const label = /[\u4e00-\u9fff]/.test(subject.name) ? subject.name : subject.enName || subject.name;
+      if (label) assetNames[pic.code] = label;
+    });
+    const audioDefs = parseAudioDefinitions(sections.subject_definitions);
+    const audioRetention = parseAudioRetention(sections.retention_analysis);
+    const voiceBindings = voice ? voice[1].trim() : "";
+    const audioRefs = mergeAudioRefs(voice ? parseVoiceBindings(voice[1]) : [], audioDefs, audioRetention);
+
+    const summaryText = String(sections.summary || "").trim();
+    const prefix = summaryText.match(SUMMARY_PREFIX_RE);
+    const summaryBody = prefix ? summaryText.slice(prefix[0].length).trim() : summaryText;
+
+    const id = head.uid;
+    const label = head.heading ? head.heading.label : String(head.from).padStart(2, "0");
+
+    if (!prefix) warnings.push(`${id} summary 缺 [reference generation + audio reference] 前缀`);
+    const missing = PROMPT_SECTIONS.filter((key) => !sections[key]);
+    if (missing.length) warnings.push(`${id} 六段式缺 ${missing.join("、")}`);
+    if (new RegExp(`(?:^|[\\s(])${STRUCT_CODE_RE}`, "m").test(body)) {
+      warnings.push(`${id} 正文出现素材编号，应只用 <Subject N>`);
+    }
+    const defined = new Set(subjects.map((item) => item.subject));
+    const used = new Set(
+      (summaryBody + " " + String(sections.detailed_description || ""))
+        .match(/<Subject\s+(\d+)>/g)?.map((item) => Number(item.replace(/\D/g, ""))) || []
+    );
+    const undefinedSubjects = Array.from(used).filter((no) => !defined.has(no));
+    if (undefinedSubjects.length) {
+      warnings.push(`${id} 正文用了未定义的 <Subject ${undefinedSubjects.join(">、<Subject ")}>`);
+    }
+
+    const unit = {
+      id,
+      scene: 1,
+      label,
+      sceneName: meta ? meta[1].trim() : title,
+      durationText: nominal ? `${nominal} 秒` : "",
+      duration: nominal,
+      // 交付稿已算好 17k+5 的帧数（向上对齐），计划工作流直接用这个值
+      frames: meta ? Number(meta[4]) : 0,
+      alignedSeconds: meta ? Number(meta[5]) : 0,
+      shot: "",
+      camera: "",
+      assets: pictures.map((item) => item.code),
+      audioRefs,
+      voiceBindings,
+      subjects,
+      audioDefinitions: audioDefs,
+      audioRetention,
+      summaryMode: prefix ? prefix[0].replace(/^\[|\]\s*$/g, "").trim() : "",
+      sections,
+      structuredPrompt: true,
+      promptZh: summaryBody,
+      promptEn: body,
+      englishOnly: true,
+      negative: "",
+      audio: voiceBindings,
+      soundscape: sections.overall_soundscape || "",
+      retention: sections.retention_analysis || "",
+      continuity: "",
+      joint: normalizeJoint(head.heading ? (head.heading.parts || []).join(" ") : ""),
+      acceptance: "",
+      risk: "",
+      firstFramePrompt: "",
+      lastFramePrompt: "",
+      tier: "B",
+      params: {
+        ...tiers.B,
+        frames: Math.max(5, Math.round((nominal || 8) * (Number(tiers.B.fps) || 16))),
+      },
+    };
+    units.push(unit);
+    scene.units.push(unit);
+  });
+
+  return {
+    title,
+    scenes: [scene],
+    units,
+    params: tiers,
+    tierMap: {},
+    warnings,
+    assets: [],
+    assetNames,
+    assetAlias: {},
+    negativePrompt: "",
+    source: "pack",
+    structured: true,
+  };
+}
+
 /**
  * 主入口：把整份 Markdown 手册解析成结构化数据
  * @returns {{title:string, scenes:Array, units:Array, params:object, tierMap:object, warnings:string[]}}
  */
 export function parseStoryboard(rawText) {
   const text = unescapeMd(String(rawText || "")).replace(/\r\n?/g, "\n");
+  // 六段式单元包：正文只按 <Subject N> / <Audio N> 解析，素材编号只认「素材绑定」行
+  if (/^subject_definitions:\s*$/m.test(text)) {
+    const structured = parseStructuredPromptPack(text);
+    if (structured) return structured;
+  }
   const lines = text.split("\n");
   const result = {
     title: "",
