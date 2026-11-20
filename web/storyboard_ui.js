@@ -13,7 +13,7 @@ import {
   parseFrameName,
   parseStoryboard,
   summarize,
-} from "./storyboard_parser.js?v=20261117g";
+} from "./storyboard_parser.js?v=20261120b";
 import {
   applyUnitParams,
   autoDetectTargets,

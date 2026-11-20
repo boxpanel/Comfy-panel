@@ -498,7 +498,7 @@ export function parseAssetNames(text) {
     if (!code || !name) return;
     const clean = String(name)
       .trim()
-      .replace(/^[（(]|[）)]$/g, "")
+      .replace(/^[（(]([\s\S]*)[）)]$/, "$1")
       .replace(/\s+/g, "");
     if (!clean) return;
     if (/^(的|与|和|在|到)/.test(clean)) return;
@@ -716,7 +716,12 @@ function parseStructuredPromptPack(text) {
     const stop = index + 1 < unitHeads.length ? unitHeads[index + 1].index : text.length;
     const block = text.slice(head.end, stop);
     const fence = block.match(/```(?:text)?\s*\n([\s\S]*?)```/);
-    const body = (fence ? fence[1] : block).trim();
+    let body = (fence ? fence[1] : block).trim();
+    // 无代码围栏时，从六段式的第一段开始，去掉场景/素材绑定/音色绑定等头部行
+    if (!fence) {
+      const start = body.search(/^subject_definitions:\s*$/m);
+      if (start > 0) body = body.slice(start).trim();
+    }
     const sections = promptSectionsOf(body);
 
     const meta = block.match(
