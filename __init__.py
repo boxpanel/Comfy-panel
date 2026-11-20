@@ -30,7 +30,7 @@ from server import PromptServer
 WEB_DIRECTORY = "./web"
 
 # 版本号：与 pyproject.toml 的 [project] version 保持一致，发版时一起改
-__version__ = "0.53.35"
+__version__ = "0.53.36"
 
 PLUGIN_DIR = Path(__file__).parent
 
@@ -190,6 +190,11 @@ def _download(item):
 @PromptServer.instance.routes.get("/storyboard/models/status")
 async def storyboard_models_status(request):
     return web.json_response({"items": _model_status(), "loras": _lora_files()})
+
+
+@PromptServer.instance.routes.get("/storyboard/version")
+async def storyboard_version(request):
+    return web.json_response({"version": __version__})
 
 
 @PromptServer.instance.routes.post("/storyboard/models/ensure")

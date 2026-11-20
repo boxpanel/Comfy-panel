@@ -70,7 +70,9 @@ import {
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
-const PANEL_VERSION = `v53.33 · 接点 · ${BRIDGE_BUILD}`;
+// 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
+// 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
+let PANEL_VERSION = `v0.53.36 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -587,7 +589,7 @@ export function createStoryboardPanel(root, app) {
   root.innerHTML = `
     <div class="sb-top">
       <div class="sb-brand">
-        <div class="sb-brand-title">分镜提示词面板 <span class="sb-ver">${PANEL_VERSION}</span></div>
+        <div class="sb-brand-title">分镜提示词面板 <span class="sb-ver" data-el="version">${PANEL_VERSION}</span></div>
         <div class="sb-brand-sub" data-el="summary">尚未导入文档</div>
       </div>
       <div class="sb-top-actions">
@@ -788,6 +790,17 @@ export function createStoryboardPanel(root, app) {
 
   el.text.value = state.raw;
   renderLog();
+
+  // 徽章显示真实插件版本：旧后端没有 /storyboard/version 时保留占位值
+  api
+    .fetchApi("/storyboard/version", { cache: "no-store" })
+    .then((response) => (response.ok ? response.json() : null))
+    .then((data) => {
+      if (!data || !data.version) return;
+      PANEL_VERSION = `v${data.version} · 接点 · ${BRIDGE_BUILD}`;
+      if (el.version) el.version.textContent = PANEL_VERSION;
+    })
+    .catch(() => {});
 
   // 上传可能由上一个面板实例发起：重建后把进度接回当前实例
   libraryListener = () => setLibraryStatus();
