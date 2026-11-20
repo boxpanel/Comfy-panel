@@ -72,7 +72,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.36 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.37 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -4267,6 +4267,8 @@ export function createStoryboardPanel(root, app) {
     negative: "05 是负向提示词：请导入 08 或 01，负向会一并读入",
     doc: "00 是项目说明，不含分镜",
     discussion: "07 是讨论记录，不含分镜",
+    voice: "04 是音色清单：音色已写在 01 每个单元的「音色绑定」行，不用单独导入",
+    manifest: "02 是单元切分清单：只用来核对镜数，不参与导入",
   };
 
   // ---------- 压缩包 ----------
@@ -4376,15 +4378,18 @@ export function createStoryboardPanel(root, app) {
   function packKindOf(name, text) {
     const lower = String(name || "").toLowerCase();
     const head = String(text || "").slice(0, 6000);
-    const prefix = (String(name || "").match(/^(\d{2})[-_. ]/) || [])[1];
-    if (prefix && PACK_FILE_KIND[prefix]) return PACK_FILE_KIND[prefix];
-    // 标准工作流单元稿（169 条六段式）：优先当主源，别让样张的「## 镜头 01」抢走
+    // 先按正文认：出包端的编号含义会变（有的包里 04 是声音清单，不是 04 镜表），
+    // 只按前缀判会把附表当主源，整包解析出 0 镜
     if (/^##\s+U\d{3}\s*[·・]\s*镜头/m.test(head) && /^subject_definitions:\s*$/m.test(head)) return "units";
     if (/\.json$/i.test(lower) || /^\uFEFF?\s*\{/.test(head)) return "json";
     if (/\.csv$/i.test(lower) || (/镜头号/.test(head.split(/\r?\n/, 1)[0] || "") && head.includes(","))) return "csv";
     if (/【镜头\s*\d+】/.test(head)) return "txt";
-    if (/素材提示词|素材清单/.test(head) || /^###\s*(?:ST|S|C|P|E|R|T|G)-\d{2}\s*[·・]/m.test(head)) return "assets";
+    if (/^#{1,3}\s*声音素材清单/m.test(head)) return "voice";
+    if (/^#{1,3}\s*(?:素材提示词|素材清单)/m.test(head) || /^###\s*(?:ST|S|C|P|E|R|T|G)-\d{2}\s*[·・]/m.test(head)) return "assets";
     if (/首帧提示词\s*[（(]/.test(head)) return "frames";
+    if (/^#{1,3}\s*.*单元切分清单/m.test(head)) return "manifest";
+    const prefix = (String(name || "").match(/^(\d{2})[-_. ]/) || [])[1];
+    if (prefix && PACK_FILE_KIND[prefix]) return PACK_FILE_KIND[prefix];
     if (/^#{1,6}\s*镜头\s*\d+/m.test(head)) return "shots";
     return "";
   }
