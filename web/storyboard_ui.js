@@ -26,7 +26,7 @@ import {
   defaultReferenceTag,
   describeImageEntry,
   detectModelProfile,
-  disableEmptyLoadVideos,
+  setLoadVideosEnabled,
   ensureH3Fps,
   ensureImageEntry,
   ensureReferenceAudio,
@@ -69,13 +69,13 @@ import {
   writePlanPromptPrefix,
   writeRuleBridgeText,
   writeH3Shot,
-} from "./storyboard_bridge.js?v=20261121c";
+} from "./storyboard_bridge.js?v=20261121d";
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.50 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.51 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -3711,9 +3711,21 @@ export function createStoryboardPanel(root, app) {
     enterDraft(true);
   }
 
+  /** 参考视频跟着分镜走：没导入分镜就停用加载视频节点；导入后只启用已经选了文件的 */
+  function syncReferenceVideos() {
+    const hasDoc = !!(state.doc && state.doc.units.length);
+    const count = setLoadVideosEnabled(app, hasDoc);
+    if (!count) return;
+    logLine(
+      hasDoc ? `已按分镜启用 ${count} 个加载视频节点` : `未导入分镜：已停用 ${count} 个加载视频节点`,
+      hasDoc ? "ok" : "warn"
+    );
+  }
+
   function refreshReady() {
     installWorkflowLoadHook();
     ensureQualityMode();
+    syncReferenceVideos();
     maybeEnsureModels();
     const ready = el.ready;
     if (!state.doc || !state.doc.units.length) {
@@ -4278,9 +4290,6 @@ export function createStoryboardPanel(root, app) {
     persist();
     renderAll();
     refreshReady();
-    // 工作流里没选文件的 VHS_LoadVideo 会拿 input 目录当文件解码：导入后先停用，等跨镜接续写入再启用
-    const disabledVideos = disableEmptyLoadVideos(app);
-    if (disabledVideos) logLine(`已停用 ${disabledVideos} 个未选文件的加载视频节点`, "warn");
     // 解析分镜后，把参考图规则写进 Plan 的共享提示词
     ensurePlanRulePrefix();
     el.guide.open = false;

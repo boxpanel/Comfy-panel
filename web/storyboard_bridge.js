@@ -5,7 +5,7 @@
 const TEXT_WIDGETS = ["text", "prompt", "string"];
 
 /** 桥接模块构建号：面板徽标里一起显示，用来确认浏览器加载的是新代码 */
-export const BRIDGE_BUILD = "20261121c";
+export const BRIDGE_BUILD = "20261121d";
 
 /** 只返回真正参与执行的工作流节点（排除静音 mode 2 与旁路 mode 4） */
 export function getNodes(app) {
@@ -1334,14 +1334,23 @@ export function ensureReferenceVideo(app, index, filename) {
   return { ok: true, loader };
 }
 
-/** 空视频的加载视频节点会拿 input 目录当文件去解码：先停用，等跨镜接续写入再启用 */
-export function disableEmptyLoadVideos(app) {
+/** 参考视频跟分镜走：没导入分镜时全部停用；导入后只启用已经选了文件的 */
+export function setLoadVideosEnabled(app, enabled) {
   let count = 0;
-  for (const node of getNodes(app)) {
+  for (const node of getAllNodes(app)) {
     if (!/LoadVideo/i.test(String(node.type || ""))) continue;
-    const widget = getWidget(node, "video");
-    const value = widget ? String(widget.value || "").trim() : "";
-    if (value && !/^none$/i.test(value)) continue;
+    if (enabled) {
+      const widget = getWidget(node, "video");
+      const value = widget ? String(widget.value || "").trim() : "";
+      if (!value || /^none$/i.test(value)) continue;
+      if (node.mode !== 0) {
+        node.mode = 0;
+        markDirty(app, node);
+        count += 1;
+      }
+      continue;
+    }
+    if (node.mode === 2 || node.mode === 4) continue;
     node.mode = 4;
     markDirty(app, node);
     count += 1;
