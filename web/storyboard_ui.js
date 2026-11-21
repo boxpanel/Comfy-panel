@@ -74,7 +74,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.44 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.45 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -198,6 +198,7 @@ const CSS = `
   background:var(--sb-card);color:var(--sb-fg);font-size:10.5px;padding:1px 4px;
 }
 .sb-frame select:focus{outline:none;border-color:var(--sb-accent);}
+.sb-frame select[data-el="draft-select"]{flex:0 0 auto;width:64px;}
 .sb-frame .sb-btn{padding:2px 7px;font-size:10px;}
 .sb-ov{width:100%;border-collapse:collapse;font-size:10px;}
 .sb-ov th,.sb-ov td{border-bottom:1px solid var(--sb-line);padding:2px 3px;text-align:left;white-space:nowrap;}
