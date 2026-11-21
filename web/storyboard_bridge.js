@@ -5,7 +5,7 @@
 const TEXT_WIDGETS = ["text", "prompt", "string"];
 
 /** 桥接模块构建号：面板徽标里一起显示，用来确认浏览器加载的是新代码 */
-export const BRIDGE_BUILD = "20261121a";
+export const BRIDGE_BUILD = "20261121b";
 
 /** 只返回真正参与执行的工作流节点（排除静音 mode 2 与旁路 mode 4） */
 export function getNodes(app) {
@@ -138,6 +138,18 @@ export function findSamplerNode(app) {
     return candidates.find((node) => /KSampler/i.test(String(node.type || ""))) || candidates[0];
   }
   return nodes.find((node) => hasWidget(node, "sampler_name")) || null;
+}
+
+/** 找真正持有 steps 控件的节点：终极篇这类工作流把步数放在 BasicScheduler 里 */
+export function findStepsNode(app) {
+  const nodes = getNodes(app).filter((node) => node.mode !== 2 && hasWidget(node, "steps"));
+  if (!nodes.length) return null;
+  return (
+    nodes.find((node) => hasWidget(node, "cfg") && hasWidget(node, "sampler_name")) ||
+    nodes.find((node) => /KSampler/i.test(String(node.type || ""))) ||
+    nodes.find((node) => /Scheduler/i.test(String(node.type || ""))) ||
+    nodes[0]
+  );
 }
 
 /** 自动识别：正向提示词 / 负面提示词 / 采样器 / 画幅节点 */
@@ -2184,23 +2196,23 @@ export function setResolutionMegapixels(app, megapixels) {
   return ok;
 }
 
-/** 读采样器当前步数；没有采样器或没有 steps 控件时返回 null */
+/** 读采样器当前步数；没有步数控件时返回 null */
 export function readSamplerSteps(app) {
-  const sampler = autoDetectTargets(app).sampler;
-  const widget = sampler ? getWidget(sampler, "steps") : null;
+  const node = findStepsNode(app);
+  const widget = node ? getWidget(node, "steps") : null;
   if (!widget) return null;
   const value = Number(widget.value);
   return Number.isFinite(value) ? value : null;
 }
 
-/** 改采样器步数（原生 Ref2V 的草稿档用） */
+/** 改采样步数（原生 Ref2V 的草稿档用） */
 export function setSamplerSteps(app, steps) {
-  const sampler = autoDetectTargets(app).sampler;
-  if (!sampler) return false;
+  const node = findStepsNode(app);
+  if (!node) return false;
   const value = Math.max(1, Math.round(Number(steps) || 0));
   if (!value) return false;
-  const ok = setWidget(sampler, "steps", value);
-  if (ok) markDirty(app, sampler);
+  const ok = setWidget(node, "steps", value);
+  if (ok) markDirty(app, node);
   return ok;
 }
 
@@ -2258,8 +2270,9 @@ export function applyUnitParams(app, unit, settings, targets, options = {}) {
     if (resolution.ok) pushDone(`画幅 ${resolution.label}`);
     else missing.push("画幅");
     // 草稿档：临时把采样步数压低，成片时不传 draftSteps，工作流原步数不动
-    if (Number(options.draftSteps) > 0 && sampler && setWidget(sampler, "steps", Math.round(options.draftSteps))) {
-      markDirty(app, sampler);
+    const stepsNode = findStepsNode(app);
+    if (Number(options.draftSteps) > 0 && stepsNode && setWidget(stepsNode, "steps", Math.round(options.draftSteps))) {
+      markDirty(app, stepsNode);
       pushDone(`草稿 ${Math.round(options.draftSteps)} 步`);
     }
     if (sampler && setWidget(sampler, "seed", seed)) {

@@ -68,13 +68,13 @@ import {
   writePlanPromptPrefix,
   writeRuleBridgeText,
   writeH3Shot,
-} from "./storyboard_bridge.js?v=20261121a";
+} from "./storyboard_bridge.js?v=20261121b";
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.48 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.49 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
