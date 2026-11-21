@@ -74,7 +74,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.42 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.43 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -208,6 +208,8 @@ const CSS = `
 .sb-ov td.verdict.pass{color:#3fb950;font-weight:600;}
 .sb-ov td.verdict.fail{color:#f85149;font-weight:600;}
 .sb-ov td.video{color:var(--sb-muted);max-width:220px;overflow:hidden;text-overflow:ellipsis;}
+.sb-ov th.pick,.sb-ov td.pick{width:22px;text-align:center;padding-right:0;}
+.sb-ov th.pick input,.sb-ov td.pick input{margin:0;cursor:pointer;}
 .sb-ov .ov-btn{
   margin-left:3px;padding:0 3px;border:1px solid var(--sb-line);border-radius:3px;
   background:transparent;color:var(--sb-muted);font-size:10px;line-height:1.4;cursor:pointer;
@@ -487,6 +489,8 @@ function loadState() {
         : null,
     // 画质档：默认草稿；只有明确选过成片才记住成片
     quality: saved.quality === "final" ? "final" : "draft",
+    // 总清单里的勾选：键为镜号，值为 false 表示不跑这一镜（没有记录 = 勾选）
+    selected: saved.selected && typeof saved.selected === "object" ? saved.selected : {},
     settings: {
       ...DEFAULT_SETTINGS,
       ...settings,
@@ -583,9 +587,6 @@ export function createStoryboardPanel(root, app) {
   let autoRunning = false;
   // 「只重跑不合格」时锁定的镜号名单；null = 正常按顺序做
   let autoRetryIds = null;
-  // 「合格镜出成片」：锁定的镜号（已做过的也要重跑）+ 本轮强制成片画质
-  let autoPassIds = null;
-  let autoFullQuality = false;
   let autoStopRequested = false;
   // 记录上一镜写进加载图像节点的首帧，下一镜没有素材时要把它清掉
   let lastAppliedImage = null;
@@ -757,7 +758,6 @@ export function createStoryboardPanel(root, app) {
           <option value="final">成片</option>
           <option value="draft">草稿</option>
         </select>
-        <button class="sb-btn" data-el="pass-final" title="把总清单里标为「合格」的单元按成片画质重新排队">合格镜出成片</button>
         <span class="sb-hint" data-el="draft-text"></span>
       </div>
       <div class="sb-frame">
@@ -857,6 +857,7 @@ export function createStoryboardPanel(root, app) {
           log: state.log.slice(-200),
           draftBase: state.draftBase,
           quality: state.quality,
+          selected: state.selected,
         })
       );
     } catch (error) {
@@ -1282,14 +1283,22 @@ export function createStoryboardPanel(root, app) {
     toast(`素材库：${entries.length} 张图片${audioText}${noteText}${frameText}，${matched} 个能对上编号`, "ok");
   }
 
+  /** 总清单里的勾选状态：没有记录 = 勾选；只有明确取消过才是 false */
+  function isPicked(unit) {
+    return unit && state.selected[unit.id] !== false;
+  }
+
   function renderOverview() {
     if (!el.overview) return;
     if (!state.doc || !state.doc.units.length) {
       el.overview.innerHTML = '<div class="sb-hint">导入文档后，这里会列出每一镜的档位与参数。</div>';
       return;
     }
-    const head =
-      "<tr><th>编号</th><th>档</th><th>时长</th><th>景别</th><th>步数</th><th>采样器</th><th>shift</th><th>输出前缀</th><th>验收</th><th>成片</th><th>状态</th></tr>";
+    const pickedCount = state.doc.units.filter(isPicked).length;
+    const allPicked = pickedCount === state.doc.units.length;
+    const head = `<tr><th class="pick"><input type="checkbox" data-pick="all" title="全选 / 全不选" ${
+      allPicked ? "checked" : ""
+    }></th><th>编号</th><th>档</th><th>时长</th><th>景别</th><th>步数</th><th>采样器</th><th>shift</th><th>输出前缀</th><th>验收</th><th>成片</th><th>状态</th></tr>`;
     const rows = state.doc.units
       .map((unit) => {
         const params = unit.params || cloneTierDefaults().B;
@@ -1298,6 +1307,9 @@ export function createStoryboardPanel(root, app) {
         const label = verdict === "pass" ? "合格" : verdict === "fail" ? "不合格" : "待检";
         const video = state.videos[unit.id];
         return `<tr class="${verdict === "fail" ? "fail" : verdict === "pass" ? "pass" : ""}">
+          <td class="pick"><input type="checkbox" data-pick="${escapeHtml(unit.id)}" title="取消勾选后全自动跳过这一镜" ${
+            isPicked(unit) ? "checked" : ""
+          }></td>
           <td>${escapeHtml(unit.id)}</td>
           <td>${escapeHtml(unit.tier)}</td>
           <td>${escapeHtml(unit.durationText || "-")}</td>
@@ -3754,7 +3766,7 @@ export function createStoryboardPanel(root, app) {
   }
 
   /** 把一镜写进工作流（提示词 / 参数 / 素材），返回是否成功与回执 */
-  async function applyUnitCore(unit, options = {}) {
+  async function applyUnitCore(unit) {
     appliedUnitId = unit.id;
     // 先接素材与上一镜视频：提示词里要按实际接上的 <Video 1> 写衔接说明
     const image = await applyVisualToUnit(unit);
@@ -3762,9 +3774,8 @@ export function createStoryboardPanel(root, app) {
     // 原生 Ref2V 的草稿状态记在 draftBase.native 里，写入时统一按草稿像素档/步数走
     const nativeDraft = !!(state.draftBase && state.draftBase.native);
     const params = applyParamsToUnit(unit, {
-      ...options,
-      megapixels: options.megapixels != null ? options.megapixels : nativeDraft ? DRAFT_MEGAPIXELS : null,
-      draftSteps: options.draftSteps != null ? options.draftSteps : nativeDraft ? DRAFT_STEPS : null,
+      megapixels: nativeDraft ? DRAFT_MEGAPIXELS : null,
+      draftSteps: nativeDraft ? DRAFT_STEPS : null,
     });
     const fight = applyUnitFight(unit);
     const ok = prompt.ok && params.ok && image.ok;
@@ -3820,26 +3831,24 @@ export function createStoryboardPanel(root, app) {
    */
   function nextAutoUnit() {
     const units = state.doc ? state.doc.units : [];
-    // 本轮是「合格镜出成片」：只跑名单里的镜，已经做过的也要重跑
-    if (autoPassIds) {
-      return units.find((unit) => autoPassIds.includes(unit.id)) || null;
-    }
-    // 本轮是「只重跑不合格」：范围锁在开跑时那份名单里，跑完就停，不会顺带做别的镜
+    // 总清单里取消勾选的镜，全自动直接跳过
+    // 「只重跑不合格」：范围锁在开跑时那份名单里，跑完就停，不会顺带做别的镜
     if (autoRetryIds) {
-      return units.find((unit) => autoRetryIds.includes(unit.id) && !state.applied[unit.id]) || null;
+      return (
+        units.find((unit) => autoRetryIds.includes(unit.id) && !state.applied[unit.id] && isPicked(unit)) || null
+      );
     }
-    const failed = units.filter((unit) => state.verdict[unit.id] === "fail");
+    const failed = units.filter((unit) => state.verdict[unit.id] === "fail" && isPicked(unit));
     if (failed.length) return failed.find((unit) => !state.applied[unit.id]) || null;
-    return units.find((unit) => !state.applied[unit.id]) || null;
+    return units.find((unit) => isPicked(unit) && !state.applied[unit.id]) || null;
   }
 
   /** 当前自动模式要跑的范围（判断文案用） */
   function autoScope() {
     const units = state.doc ? state.doc.units : [];
-    if (autoPassIds) return { mode: "pass", units: units.filter((unit) => autoPassIds.includes(unit.id)) };
-    const failed = units.filter((unit) => state.verdict[unit.id] === "fail");
+    const failed = units.filter((unit) => state.verdict[unit.id] === "fail" && isPicked(unit));
     if (failed.length) return { mode: "retry", units: failed };
-    return { mode: "fresh", units: units.filter((unit) => !state.applied[unit.id]) };
+    return { mode: "fresh", units: units.filter((unit) => isPicked(unit) && !state.applied[unit.id]) };
   }
 
   /** 提交当前画布到队列，返回 prompt_id */
@@ -4011,7 +4020,7 @@ export function createStoryboardPanel(root, app) {
     return missing;
   }
 
-  async function runAuto(options = {}) {
+  async function runAuto() {
     if (!state.doc || !state.doc.units.length) {
       if (el.auto) el.auto.checked = false;
       toast("先导入分镜文档，再开自动模式", "err");
@@ -4036,40 +4045,24 @@ export function createStoryboardPanel(root, app) {
     applying = true;
     el.next.disabled = true;
     if (el.auto) el.auto.checked = true;
-    // 合格镜出成片：锁定镜号并强制成片画质；普通自动模式走低画质草稿
-    autoPassIds = Array.isArray(options.ids) && options.ids.length ? [...options.ids] : null;
-    autoFullQuality = !!options.fullQuality;
     const scope = autoScope();
-    if (scope.mode === "pass") {
-      const names = scope.units.slice(0, 5).map((unit) => unit.id).join("、");
-      logLine(
-        `合格镜出成片：${scope.units.length} 镜（${names}${scope.units.length > 5 ? "…" : ""}），按成片画质重跑`
-      );
-    } else if (scope.mode === "retry") {
+    if (scope.mode === "retry") {
       const names = scope.units.slice(0, 5).map((unit) => unit.id).join("、");
       logLine(`自动模式开始：只重跑不合格的 ${scope.units.length} 镜（${names}${scope.units.length > 5 ? "…" : ""}）`);
     } else {
       logLine(
-        `自动模式开始：共 ${state.doc.units.length} 镜，${
+        `自动模式开始：共 ${state.doc.units.length} 镜，勾选 ${scope.units.length} 镜，${
           state.draftBase ? `草稿档（${DRAFT_STEPS} 步）` : "成片档"
         }`
       );
     }
     autoRetryIds = scope.mode === "retry" ? scope.units.map((unit) => unit.id) : null;
-    // 画质听「草稿/成片」开关：开了草稿才降档，没开就是成片；出成片那一轮若原本在草稿，跑完再还原
-    const draftBefore = !!state.draftBase;
-    if (autoFullQuality && draftBefore) finishDraft();
     let done = 0;
     let lostRetries = 0;
     try {
       while (!autoStopRequested) {
         const unit = nextAutoUnit();
         if (!unit) {
-          if (scope.mode === "pass") {
-            setAutoStatus(`合格镜出成片完成：本次 ${done} 镜，请逐镜复看最终画质`);
-            toast(`合格镜出成片完成：本次 ${done} 镜`, "ok");
-            break;
-          }
           if (scope.mode === "retry") {
             setAutoStatus(`不合格重跑完成：本次重跑 ${done} 镜，回列表复看后标合格/不合格`);
             toast(`不合格重跑完成：本次 ${done} 镜，记得复看`, "ok");
@@ -4164,13 +4157,11 @@ export function createStoryboardPanel(root, app) {
         }
         // 重跑的不合格镜出了新片：回到「待检」，等人工再验一遍
         if (state.verdict[unit.id] === "fail") delete state.verdict[unit.id];
-        // 合格镜出了成片：回到「待检」，别让旧结论盖住新画面；
-        // 名单必须在这一镜成功后立刻摘掉，否则同一个编号会被反复取到
-        if (autoPassIds) {
-          if (state.verdict[unit.id] === "pass") delete state.verdict[unit.id];
-          autoPassIds = autoPassIds.filter((id) => id !== unit.id);
-        }
+        // 生成成功就把这一镜在总清单里取消勾选，表示本批已处理
+        state.selected[unit.id] = false;
         persist();
+        renderOverview();
+        renderProgress();
         // 生成成功才算这一镜完成，避免中途停止时把没出片的镜标成已完成
         markApplied(unit, true);
         advancePlanAfterApply();
@@ -4198,13 +4189,9 @@ export function createStoryboardPanel(root, app) {
     } finally {
       autoRunning = false;
       autoRetryIds = null;
-      autoPassIds = null;
       applying = false;
       if (el.next) el.next.disabled = false;
       if (el.auto) el.auto.checked = false;
-      // 出成片前临时退掉的草稿，跑完恢复成用户原来的草稿状态
-      if (autoFullQuality && draftBefore && !state.draftBase) enterDraft(true);
-      autoFullQuality = false;
       if (autoStopRequested) setAutoStatus(`已停止（完成 ${done} 镜）`);
       // 跑完把卡片重画一遍：重跑过的镜要从「不合格」回到「待检」
       renderList();
@@ -4274,6 +4261,8 @@ export function createStoryboardPanel(root, app) {
       logLine("已采用提示词包的全局负向提示词", "ok");
     }
     state.applied = {};
+    // 新文档导入后总清单全部重新勾选
+    state.selected = {};
     const docIds = new Set(state.doc.units.map((unit) => unit.id));
     // 旧成片名留着给列表面板回看；接续用的 shots 清空，避免拿上一批的片接本批
     state.videos = Object.fromEntries(
@@ -5019,24 +5008,6 @@ export function createStoryboardPanel(root, app) {
     updateDraftRow();
   });
 
-  // 两段式出片：草稿全部跑完、在总清单里标好合格后，一次性按成片画质重跑这些镜
-  el["pass-final"].addEventListener("click", () => {
-    if (autoRunning) {
-      toast("自动模式正在跑，等这一轮结束再出成片", "err");
-      return;
-    }
-    const ids = (state.doc ? state.doc.units : [])
-      .filter((unit) => state.verdict[unit.id] === "pass")
-      .map((unit) => unit.id);
-    if (!ids.length) {
-      toast("还没有标记合格的单元：先在总清单里点「✓」", "err");
-      return;
-    }
-    runAuto({ ids, fullQuality: true }).catch((error) =>
-      toast(`出成片失败：${error && error.message ? error.message : error}`, "err")
-    );
-  });
-
   el["refresh-images"].addEventListener("click", () => {
     loadImageFiles();
     toast("已刷新首帧图列表");
@@ -5054,6 +5025,24 @@ export function createStoryboardPanel(root, app) {
         return;
       }
       setVerdict(unitId, target.dataset.ov === "pass" ? "pass" : "fail");
+    });
+
+    // 勾选决定全自动跑不跑这一镜；全选框控制整批
+    el.overview.addEventListener("change", (event) => {
+      const box = event.target.closest("[data-pick]");
+      if (!box) return;
+      const units = state.doc ? state.doc.units : [];
+      if (box.dataset.pick === "all") {
+        if (box.checked) state.selected = {};
+        else units.forEach((unit) => { state.selected[unit.id] = false; });
+      } else if (box.checked) {
+        delete state.selected[box.dataset.pick];
+      } else {
+        state.selected[box.dataset.pick] = false;
+      }
+      persist();
+      renderOverview();
+      renderProgress();
     });
   }
 
