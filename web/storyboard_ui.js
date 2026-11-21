@@ -74,7 +74,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.41 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.42 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -485,6 +485,8 @@ function loadState() {
       (saved.draftBase.native === true || (saved.draftBase.width && saved.draftBase.height))
         ? saved.draftBase
         : null,
+    // 画质档：默认草稿；只有明确选过成片才记住成片
+    quality: saved.quality === "final" ? "final" : "draft",
     settings: {
       ...DEFAULT_SETTINGS,
       ...settings,
@@ -854,6 +856,7 @@ export function createStoryboardPanel(root, app) {
           verdict: state.verdict,
           log: state.log.slice(-200),
           draftBase: state.draftBase,
+          quality: state.quality,
         })
       );
     } catch (error) {
@@ -1835,7 +1838,9 @@ export function createStoryboardPanel(root, app) {
     if (!info && !native && !samplerReady) return;
     const base = state.draftBase;
     // 下拉框反映真实状态：草稿 / 成片
-    if (el["draft-select"]) el["draft-select"].value = base ? "draft" : "final";
+    if (el["draft-select"]) {
+      el["draft-select"].value = base ? "draft" : state.quality === "final" ? "final" : "draft";
+    }
     if (info) {
       el["draft-text"].textContent = base
         ? `草稿（仅本次运行）${draftTargetSize(base).width}×${draftTargetSize(base).height} · ${DRAFT_STEPS} 步；分镜记录 ${info.width}×${info.height}`
@@ -1865,6 +1870,7 @@ export function createStoryboardPanel(root, app) {
         draftWidth: size.width,
         draftHeight: size.height,
       };
+      state.quality = "draft";
       persist();
       renderPlanRow();
       updateDraftRow();
@@ -1883,6 +1889,7 @@ export function createStoryboardPanel(root, app) {
       return;
     }
     state.draftBase = { native: true, megapixels: native ? native.megapixels : null, steps };
+    state.quality = "draft";
     persist();
     updateDraftRow();
     if (silent) return;
@@ -1896,7 +1903,10 @@ export function createStoryboardPanel(root, app) {
 
   function finishDraft() {
     const base = state.draftBase;
+    state.quality = "final";
     if (!base) {
+      persist();
+      updateDraftRow();
       toast("当前已经是成片模式", "ok");
       return;
     }
@@ -3665,8 +3675,19 @@ export function createStoryboardPanel(root, app) {
     app.__sbModelHooked = true;
   }
 
+  /** 默认画质档是草稿：工作流一认出来就先建好 draftBase，手动写镜也按草稿走 */
+  function ensureQualityMode() {
+    if (state.quality === "final" || state.draftBase) return;
+    const info = getPlanResolution(app);
+    const native = info ? null : readResolutionSettings(app);
+    const hasSampler = info || native ? false : readSamplerSteps(app) != null;
+    if (!info && !native && !hasSampler) return;
+    enterDraft(true);
+  }
+
   function refreshReady() {
     installWorkflowLoadHook();
+    ensureQualityMode();
     maybeEnsureModels();
     const ready = el.ready;
     if (!state.doc || !state.doc.units.length) {
