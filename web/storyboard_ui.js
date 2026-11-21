@@ -72,8 +72,8 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.38 · 接点 · ${BRIDGE_BUILD}`;
-const DRAFT_STEPS = 10;
+let PANEL_VERSION = `v0.53.39 · 接点 · ${BRIDGE_BUILD}`;
+const DRAFT_STEPS = 6;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
 
@@ -773,7 +773,7 @@ export function createStoryboardPanel(root, app) {
       </div>
       <div class="sb-frame" data-el="draft-row" hidden>
         <span class="label">草稿/成片</span>
-        <button class="sb-btn" data-el="draft" title="只在本次运行临时降分辨率 + 10 步，不改分镜里的分辨率">草稿</button>
+        <button class="sb-btn" data-el="draft" title="只在本次运行临时降到 640×360 + 6 步，不改分镜里的分辨率">草稿</button>
         <button class="sb-btn" data-el="final" title="按分镜记录的分辨率与步数出成片">成片</button>
         <button class="sb-btn" data-el="pass-final" title="把总清单里标为「合格」的单元按成片画质重新排队">合格镜出成片</button>
         <span class="sb-hint" data-el="draft-text"></span>
@@ -1749,17 +1749,17 @@ export function createStoryboardPanel(root, app) {
     return frames;
   }
 
-  /** 草稿分辨率：成片尺寸的一半，按 32 对齐 */
+  /** 草稿分辨率：宽固定 640，高按原比例对齐到 8（16:9 就是 640×360） */
   function draftSize(width, height) {
-    const step = 32;
-    const round = (value) => Math.max(step * 2, Math.round((Number(value) * 0.5) / step) * step);
-    return { width: round(width), height: round(height) };
+    const sourceWidth = Number(width) > 0 ? Number(width) : 1280;
+    const sourceHeight = Number(height) > 0 ? Number(height) : 720;
+    const w = Math.min(640, Math.max(320, Math.round(sourceWidth / 8) * 8));
+    const h = Math.max(192, Math.round((w * sourceHeight) / sourceWidth / 8) * 8);
+    return { width: w, height: h };
   }
 
   function draftTargetSize(draft) {
-    if (draft && draft.draftWidth && draft.draftHeight) {
-      return { width: draft.draftWidth, height: draft.draftHeight };
-    }
+    // 每次按当前成片尺寸重算，避免旧的草稿尺寸（比如半分辨率）残留在存档里
     return draftSize(draft.width, draft.height);
   }
 
@@ -3977,7 +3977,7 @@ export function createStoryboardPanel(root, app) {
       logLine(`自动模式开始：共 ${state.doc.units.length} 镜，低画质 ${AUTO_MEGAPIXELS}MP`);
     }
     autoRetryIds = scope.mode === "retry" ? scope.units.map((unit) => unit.id) : null;
-    // 低画质：原生 Ref2V 临时降像素档；H3 计划工作流走草稿（10 步 + 半分辨率）
+    // 低画质：原生 Ref2V 临时降像素档；H3 计划工作流走草稿（6 步 + 640 宽）
     const before = readResolutionSettings(app);
     const megapixelsBackup = before ? before.megapixels : null;
     const draftBefore = !!state.draftBase;
