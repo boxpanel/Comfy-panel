@@ -5,7 +5,7 @@
 const TEXT_WIDGETS = ["text", "prompt", "string"];
 
 /** 桥接模块构建号：面板徽标里一起显示，用来确认浏览器加载的是新代码 */
-export const BRIDGE_BUILD = "20261121b";
+export const BRIDGE_BUILD = "20261121c";
 
 /** 只返回真正参与执行的工作流节点（排除静音 mode 2 与旁路 mode 4） */
 export function getNodes(app) {
@@ -1334,6 +1334,21 @@ export function ensureReferenceVideo(app, index, filename) {
   return { ok: true, loader };
 }
 
+/** 空视频的加载视频节点会拿 input 目录当文件去解码：先停用，等跨镜接续写入再启用 */
+export function disableEmptyLoadVideos(app) {
+  let count = 0;
+  for (const node of getNodes(app)) {
+    if (!/LoadVideo/i.test(String(node.type || ""))) continue;
+    const widget = getWidget(node, "video");
+    const value = widget ? String(widget.value || "").trim() : "";
+    if (value && !/^none$/i.test(value)) continue;
+    node.mode = 4;
+    markDirty(app, node);
+    count += 1;
+  }
+  return count;
+}
+
 /** 清空面板经手的参考视频位，加载视频节点停用（保留 GetNode → Ref2V 的线） */
 export function clearVideoSlotsFrom(app, keep) {
   const count = Math.max(0, Math.trunc(Number(keep) || 0));
@@ -1342,13 +1357,16 @@ export function clearVideoSlotsFrom(app, keep) {
     if (slot.index < count) continue;
     const loader = slot.loader;
     if (!loader || !/LoadVideo/i.test(String(loader.type || ""))) continue;
-    // 只动面板写过的，用户自己接的视频不碰
-    if (!loader.properties || loader.properties.sbRefVideo == null) continue;
+    // 面板写过的视频位要清；没写过的空视频位也一并停用，
+    // 否则 VHS_LoadVideo 会拿空路径当 input 目录去解码，直接报 could not be loaded with cv
+    const widget = getWidget(loader, "video");
+    const value = widget ? String(widget.value || "").trim() : "";
+    const blank = !value || /^none$/i.test(value);
+    if (!blank && (!loader.properties || loader.properties.sbRefVideo == null)) continue;
     if (slot.setter) {
       if (clearChainSlot(app, slot)) cleared += 1;
       continue;
     }
-    const widget = getWidget(loader, "video");
     if (widget) widget.value = "";
     loader.mode = 4;
     markDirty(app, loader);
