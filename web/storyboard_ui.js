@@ -74,7 +74,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.47 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.48 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -1287,6 +1287,15 @@ export function createStoryboardPanel(root, app) {
     return unit && state.selected[unit.id] !== false;
   }
 
+  /** 总清单里显示的步数：草稿档显示实际会跑的步数 */
+  function displaySteps(params) {
+    const base = state.draftBase;
+    if (!base) return params.steps;
+    // 原生 Ref2V 没有采样器步数控件时，步数不受草稿影响
+    if (base.native && base.steps == null) return params.steps;
+    return DRAFT_STEPS;
+  }
+
   function renderOverview() {
     if (!el.overview) return;
     if (!state.doc || !state.doc.units.length) {
@@ -1313,7 +1322,7 @@ export function createStoryboardPanel(root, app) {
           <td>${escapeHtml(unit.tier)}</td>
           <td>${escapeHtml(unit.durationText || "-")}</td>
           <td>${escapeHtml(unit.shot || "-")}</td>
-          <td>${params.steps}</td>
+          <td>${displaySteps(params)}</td>
           <td>${escapeHtml(params.sampler)}</td>
           <td>${params.shift}</td>
           <td>${escapeHtml(unit.id + "_")}</td>
@@ -1885,6 +1894,7 @@ export function createStoryboardPanel(root, app) {
       persist();
       renderPlanRow();
       updateDraftRow();
+      renderOverview();
       if (silent) return;
       toast(
         `草稿模式：运行时临时 ${size.width}×${size.height}、${DRAFT_STEPS} 步；分镜里仍是 ${info.width}×${info.height}，确认后点「成片」`,
@@ -1903,6 +1913,7 @@ export function createStoryboardPanel(root, app) {
     state.quality = "draft";
     persist();
     updateDraftRow();
+    renderOverview();
     if (silent) return;
     toast(
       `草稿模式：${native && native.megapixels != null ? `${DRAFT_MEGAPIXELS}MP` : "原画幅"}${
@@ -1918,6 +1929,7 @@ export function createStoryboardPanel(root, app) {
     if (!base) {
       persist();
       updateDraftRow();
+      renderOverview();
       toast("当前已经是成片模式", "ok");
       return;
     }
@@ -1927,6 +1939,7 @@ export function createStoryboardPanel(root, app) {
       state.draftBase = null;
       persist();
       updateDraftRow();
+      renderOverview();
       toast(
         `成片模式：${base.megapixels != null ? `${base.megapixels}MP` : "原画幅"}${
           base.steps != null ? ` · ${base.steps} 步` : ""
@@ -1943,6 +1956,7 @@ export function createStoryboardPanel(root, app) {
     state.draftBase = null;
     persist();
     renderPlanRow();
+    renderOverview();
     toast(`成片模式：按分镜记录的 ${base.width}×${base.height} 生成`, "ok");
   }
 
