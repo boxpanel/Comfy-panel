@@ -74,7 +74,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.43 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.44 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -585,8 +585,6 @@ export function createStoryboardPanel(root, app) {
   let applying = false;
   // 全自动：应用一镜 → 排队 → 等生成完成 → 下一镜
   let autoRunning = false;
-  // 「只重跑不合格」时锁定的镜号名单；null = 正常按顺序做
-  let autoRetryIds = null;
   let autoStopRequested = false;
   // 记录上一镜写进加载图像节点的首帧，下一镜没有素材时要把它清掉
   let lastAppliedImage = null;
@@ -1321,7 +1319,7 @@ export function createStoryboardPanel(root, app) {
           <td class="verdict ${verdict || ""}">
             <span class="v-label">${label}</span>
             <button class="ov-btn pass" data-ov="pass" data-id="${escapeHtml(unit.id)}" title="标为合格">✓</button>
-            <button class="ov-btn fail" data-ov="fail" data-id="${escapeHtml(unit.id)}" title="标为不合格，下次自动只重跑这几镜">✗</button>
+            <button class="ov-btn fail" data-ov="fail" data-id="${escapeHtml(unit.id)}" title="标为不合格（只做标记，不影响自动模式）">✗</button>
           </td>
           <td class="video">${
             video && video.filename
@@ -1355,9 +1353,9 @@ export function createStoryboardPanel(root, app) {
       el.next.textContent = "▶ 应用下一镜";
       return;
     }
-    const failed = units.find((unit) => state.verdict[unit.id] === "fail" && !state.applied[unit.id]);
-    const next = failed || visibleUnits().find((unit) => !state.applied[unit.id]);
-    el.next.textContent = next ? `▶ ${failed ? "重跑" : "下一镜"}：${next.id}` : "▶ 这一批做完了";
+    // 验收只是人工标记，不参与选镜：下一镜永远按顺序取还没做过的
+    const next = visibleUnits().find((unit) => !state.applied[unit.id]);
+    el.next.textContent = next ? `▶ 下一镜：${next.id}` : "▶ 这一批做完了";
     renderFrameSelector();
   }
 
@@ -2362,7 +2360,7 @@ export function createStoryboardPanel(root, app) {
         </div>
         <div class="sb-player"><video controls autoplay playsinline src="${escapeHtml(shotViewUrl(shot))}"></video></div>
         <div class="sb-modal-foot">
-          <span class="sb-hint grow">有问题就标不合格，重新导入分镜后只重跑这几镜</span>
+          <span class="sb-hint grow">有问题就标不合格，提醒自己这一镜要重做（标记不影响自动模式）</span>
           <button class="sb-btn ok" data-player="pass">合格</button>
           <button class="sb-btn bad" data-player="fail">不合格</button>
         </div>
@@ -2386,7 +2384,7 @@ export function createStoryboardPanel(root, app) {
     playerWrap = wrap;
   }
 
-  /** 记下这一镜的验收结论；不合格的镜下次开自动模式会单独重跑 */
+  /** 记下这一镜的验收结论；只作人工标记，不参与自动调度 */
   function setVerdict(unitId, value) {
     if (value === "pass" || value === "fail") state.verdict[unitId] = value;
     else delete state.verdict[unitId];
@@ -3826,29 +3824,19 @@ export function createStoryboardPanel(root, app) {
   }
 
   /**
-   * 自动模式按文档顺序做，不受搜索/筛选影响。
-   * 只要列表里还有「不合格」，就只重跑这几镜；否则做还没做过的。
+   * 自动模式只看总清单的勾选：勾着就跑，跑完自动取消。
+   * 合格/不合格是人工标记，不参与选镜。
    */
   function nextAutoUnit() {
     const units = state.doc ? state.doc.units : [];
-    // 总清单里取消勾选的镜，全自动直接跳过
-    // 「只重跑不合格」：范围锁在开跑时那份名单里，跑完就停，不会顺带做别的镜
-    if (autoRetryIds) {
-      return (
-        units.find((unit) => autoRetryIds.includes(unit.id) && !state.applied[unit.id] && isPicked(unit)) || null
-      );
-    }
-    const failed = units.filter((unit) => state.verdict[unit.id] === "fail" && isPicked(unit));
-    if (failed.length) return failed.find((unit) => !state.applied[unit.id]) || null;
-    return units.find((unit) => isPicked(unit) && !state.applied[unit.id]) || null;
+    // 只看总清单的勾选：勾着就跑，跑完自动取消。验收结论不参与调度
+    return units.find((unit) => isPicked(unit)) || null;
   }
 
   /** 当前自动模式要跑的范围（判断文案用） */
   function autoScope() {
     const units = state.doc ? state.doc.units : [];
-    const failed = units.filter((unit) => state.verdict[unit.id] === "fail" && isPicked(unit));
-    if (failed.length) return { mode: "retry", units: failed };
-    return { mode: "fresh", units: units.filter((unit) => isPicked(unit) && !state.applied[unit.id]) };
+    return { mode: "fresh", units: units.filter((unit) => isPicked(unit)) };
   }
 
   /** 提交当前画布到队列，返回 prompt_id */
@@ -4046,36 +4034,18 @@ export function createStoryboardPanel(root, app) {
     el.next.disabled = true;
     if (el.auto) el.auto.checked = true;
     const scope = autoScope();
-    if (scope.mode === "retry") {
-      const names = scope.units.slice(0, 5).map((unit) => unit.id).join("、");
-      logLine(`自动模式开始：只重跑不合格的 ${scope.units.length} 镜（${names}${scope.units.length > 5 ? "…" : ""}）`);
-    } else {
-      logLine(
-        `自动模式开始：共 ${state.doc.units.length} 镜，勾选 ${scope.units.length} 镜，${
-          state.draftBase ? `草稿档（${DRAFT_STEPS} 步）` : "成片档"
-        }`
-      );
-    }
-    autoRetryIds = scope.mode === "retry" ? scope.units.map((unit) => unit.id) : null;
+    logLine(
+      `自动模式开始：共 ${state.doc.units.length} 镜，勾选 ${scope.units.length} 镜，${
+        state.draftBase ? `草稿档（${DRAFT_STEPS} 步）` : "成片档"
+      }`
+    );
     let done = 0;
     let lostRetries = 0;
     try {
       while (!autoStopRequested) {
         const unit = nextAutoUnit();
         if (!unit) {
-          if (scope.mode === "retry") {
-            setAutoStatus(`不合格重跑完成：本次重跑 ${done} 镜，回列表复看后标合格/不合格`);
-            toast(`不合格重跑完成：本次 ${done} 镜，记得复看`, "ok");
-            break;
-          }
-          // 之前跑过的镜会留在「已做」里，自动模式不会重跑：把数字说清楚
-          const total = state.doc.units.length;
-          const skipped = Math.max(0, total - done);
-          setAutoStatus(
-            `全部完成：本次跑了 ${done} 镜${
-              skipped ? `，另有 ${skipped} 镜之前已标记完成（要重跑请重新导入文档）` : ""
-            }`
-          );
+          setAutoStatus(`全部完成：本次跑了 ${done} 镜`);
           toast(`自动模式完成：本次生成 ${done} 镜`, "ok");
           break;
         }
@@ -4188,7 +4158,6 @@ export function createStoryboardPanel(root, app) {
       toast(`自动模式异常停止：${reason}`, "err");
     } finally {
       autoRunning = false;
-      autoRetryIds = null;
       applying = false;
       if (el.next) el.next.disabled = false;
       if (el.auto) el.auto.checked = false;
@@ -4272,12 +4241,12 @@ export function createStoryboardPanel(root, app) {
     state.continuity = {};
     state.fight = {};
     state.autoNote = "";
-    // 验收结论跨导入保留（改完提示词重导后只重跑不合格）；新包里没有的镜号丢掉
+    // 验收结论跨导入保留（方便看哪些镜要重做）；新包里没有的镜号丢掉
     state.verdict = Object.fromEntries(
       Object.entries(state.verdict || {}).filter(([id]) => docIds.has(id))
     );
     const failedCount = Object.values(state.verdict).filter((value) => value === "fail").length;
-    if (failedCount) logLine(`导入完成：列表里有 ${failedCount} 镜标了不合格，开自动模式只会重跑这几镜`, "warn");
+    if (failedCount) logLine(`导入完成：列表里有 ${failedCount} 镜标了不合格（仅标记，不影响自动模式）`, "warn");
     // 新分镜：旧的首帧选择和自定义标签都属于上一批素材，清掉避免串用
     const docCodes = new Set();
     state.doc.units.forEach((unit) => (unit.assets || []).forEach((code) => docCodes.add(code)));
