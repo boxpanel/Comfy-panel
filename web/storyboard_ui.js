@@ -74,7 +74,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.40 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.41 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -749,8 +749,17 @@ export function createStoryboardPanel(root, app) {
         <button class="sb-btn primary" data-el="next">▶ 应用下一镜</button>
         <label class="sb-todo"><input type="checkbox" data-el="hide-done"> 隐藏已做</label>
       </div>
+      <div class="sb-frame" data-el="draft-row" hidden>
+        <span class="label">画质</span>
+        <select data-el="draft-select" title="草稿：计划链 640 宽 + 6 步；原生 Ref2V 0.25MP + 6 步。成片：按工作流原始画质与步数">
+          <option value="final">成片</option>
+          <option value="draft">草稿</option>
+        </select>
+        <button class="sb-btn" data-el="pass-final" title="把总清单里标为「合格」的单元按成片画质重新排队">合格镜出成片</button>
+        <span class="sb-hint" data-el="draft-text"></span>
+      </div>
       <div class="sb-frame">
-        <label class="sb-chk"><input type="checkbox" data-el="auto"> 全自动（低画质）</label>
+        <label class="sb-chk"><input type="checkbox" data-el="auto"> 全自动</label>
         <span class="sb-hint grow" data-el="auto-text">开启后自动：应用 → 排队 → 等生成完成 → 下一镜</span>
       </div>
       <div class="sb-frame">
@@ -774,13 +783,6 @@ export function createStoryboardPanel(root, app) {
         <span class="label" data-el="plan-label">H3 计划</span>
         <select data-el="plan-shot"></select>
         <button class="sb-btn" data-el="plan-sync" title="把整份分镜写入 H3 计划">⇩ 写入全部</button>
-      </div>
-      <div class="sb-frame" data-el="draft-row" hidden>
-        <span class="label">草稿/成片</span>
-        <button class="sb-btn" data-el="draft" title="只在本次运行降画质：计划链 640 宽 + 6 步；原生 Ref2V 0.25MP + 6 步">草稿</button>
-        <button class="sb-btn" data-el="final" title="按工作流原始画质与步数出片">成片</button>
-        <button class="sb-btn" data-el="pass-final" title="把总清单里标为「合格」的单元按成片画质重新排队">合格镜出成片</button>
-        <span class="sb-hint" data-el="draft-text"></span>
       </div>
       <div class="sb-chips" data-el="chips"></div>
       <input class="sb-search" data-el="search" placeholder="搜索单元编号或提示词…">
@@ -1832,6 +1834,8 @@ export function createStoryboardPanel(root, app) {
     row.hidden = !info && !native && !samplerReady;
     if (!info && !native && !samplerReady) return;
     const base = state.draftBase;
+    // 下拉框反映真实状态：草稿 / 成片
+    if (el["draft-select"]) el["draft-select"].value = base ? "draft" : "final";
     if (info) {
       el["draft-text"].textContent = base
         ? `草稿（仅本次运行）${draftTargetSize(base).width}×${draftTargetSize(base).height} · ${DRAFT_STEPS} 步；分镜记录 ${info.width}×${info.height}`
@@ -4987,8 +4991,12 @@ export function createStoryboardPanel(root, app) {
     toast(`已把 ${count} 镜写入 H3 计划（替换原有镜头）`, "ok");
   });
 
-  el["draft"].addEventListener("click", () => enterDraft());
-  el["final"].addEventListener("click", () => finishDraft());
+  el["draft-select"].addEventListener("change", () => {
+    if (el["draft-select"].value === "draft") enterDraft();
+    else finishDraft();
+    // 切换失败（工作流没有可调控件）时把下拉框拨回真实状态
+    updateDraftRow();
+  });
 
   // 两段式出片：草稿全部跑完、在总清单里标好合格后，一次性按成片画质重跑这些镜
   el["pass-final"].addEventListener("click", () => {
