@@ -72,7 +72,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.37 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.38 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 10;
 // 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
 const AUTO_MEGAPIXELS = 0.5;
@@ -577,6 +577,9 @@ export function createStoryboardPanel(root, app) {
   let autoRunning = false;
   // 「只重跑不合格」时锁定的镜号名单；null = 正常按顺序做
   let autoRetryIds = null;
+  // 「合格镜出成片」：锁定的镜号（已做过的也要重跑）+ 本轮强制成片画质
+  let autoPassIds = null;
+  let autoFullQuality = false;
   let autoStopRequested = false;
   // 记录上一镜写进加载图像节点的首帧，下一镜没有素材时要把它清掉
   let lastAppliedImage = null;
@@ -772,6 +775,7 @@ export function createStoryboardPanel(root, app) {
         <span class="label">草稿/成片</span>
         <button class="sb-btn" data-el="draft" title="只在本次运行临时降分辨率 + 10 步，不改分镜里的分辨率">草稿</button>
         <button class="sb-btn" data-el="final" title="按分镜记录的分辨率与步数出成片">成片</button>
+        <button class="sb-btn" data-el="pass-final" title="把总清单里标为「合格」的单元按成片画质重新排队">合格镜出成片</button>
         <span class="sb-hint" data-el="draft-text"></span>
       </div>
       <div class="sb-chips" data-el="chips"></div>
@@ -1829,14 +1833,14 @@ export function createStoryboardPanel(root, app) {
     }
   }
 
-  function enterDraft() {
+  function enterDraft(silent = false) {
     const info = getPlanResolution(app);
     if (!info) {
       toast("当前工作流没有 H3 计划节点", "err");
       return;
     }
     if (state.draftBase) {
-      toast("已经在草稿模式；点「成片」恢复按分镜原分辨率生成", "ok");
+      if (!silent) toast("已经在草稿模式；点「成片」恢复按分镜原分辨率生成", "ok");
       return;
     }
     const size = draftSize(info.width, info.height);
@@ -1849,6 +1853,7 @@ export function createStoryboardPanel(root, app) {
     };
     persist();
     renderPlanRow();
+    if (silent) return;
     toast(
       `草稿模式：运行时临时 ${size.width}×${size.height}、${DRAFT_STEPS} 步；分镜里仍是 ${info.width}×${info.height}，确认后点「成片」`,
       "ok"
@@ -3740,6 +3745,10 @@ export function createStoryboardPanel(root, app) {
    */
   function nextAutoUnit() {
     const units = state.doc ? state.doc.units : [];
+    // 本轮是「合格镜出成片」：只跑名单里的镜，已经做过的也要重跑
+    if (autoPassIds) {
+      return units.find((unit) => autoPassIds.includes(unit.id)) || null;
+    }
     // 本轮是「只重跑不合格」：范围锁在开跑时那份名单里，跑完就停，不会顺带做别的镜
     if (autoRetryIds) {
       return units.find((unit) => autoRetryIds.includes(unit.id) && !state.applied[unit.id]) || null;
@@ -3752,6 +3761,7 @@ export function createStoryboardPanel(root, app) {
   /** 当前自动模式要跑的范围（判断文案用） */
   function autoScope() {
     const units = state.doc ? state.doc.units : [];
+    if (autoPassIds) return { mode: "pass", units: units.filter((unit) => autoPassIds.includes(unit.id)) };
     const failed = units.filter((unit) => state.verdict[unit.id] === "fail");
     if (failed.length) return { mode: "retry", units: failed };
     return { mode: "fresh", units: units.filter((unit) => !state.applied[unit.id]) };
@@ -3926,7 +3936,7 @@ export function createStoryboardPanel(root, app) {
     return missing;
   }
 
-  async function runAuto() {
+  async function runAuto(options = {}) {
     if (!state.doc || !state.doc.units.length) {
       if (el.auto) el.auto.checked = false;
       toast("先导入分镜文档，再开自动模式", "err");
@@ -3951,8 +3961,16 @@ export function createStoryboardPanel(root, app) {
     applying = true;
     el.next.disabled = true;
     if (el.auto) el.auto.checked = true;
+    // 合格镜出成片：锁定镜号并强制成片画质；普通自动模式走低画质草稿
+    autoPassIds = Array.isArray(options.ids) && options.ids.length ? [...options.ids] : null;
+    autoFullQuality = !!options.fullQuality;
     const scope = autoScope();
-    if (scope.mode === "retry") {
+    if (scope.mode === "pass") {
+      const names = scope.units.slice(0, 5).map((unit) => unit.id).join("、");
+      logLine(
+        `合格镜出成片：${scope.units.length} 镜（${names}${scope.units.length > 5 ? "…" : ""}），按成片画质重跑`
+      );
+    } else if (scope.mode === "retry") {
       const names = scope.units.slice(0, 5).map((unit) => unit.id).join("、");
       logLine(`自动模式开始：只重跑不合格的 ${scope.units.length} 镜（${names}${scope.units.length > 5 ? "…" : ""}）`);
     } else {
@@ -3963,13 +3981,19 @@ export function createStoryboardPanel(root, app) {
     const before = readResolutionSettings(app);
     const megapixelsBackup = before ? before.megapixels : null;
     const draftBefore = !!state.draftBase;
-    if (planInfoSafe() && !draftBefore) enterDraft();
+    if (planInfoSafe() && !draftBefore && !autoFullQuality) enterDraft();
+    if (autoFullQuality && draftBefore) finishDraft();
     let done = 0;
     let lostRetries = 0;
     try {
       while (!autoStopRequested) {
         const unit = nextAutoUnit();
         if (!unit) {
+          if (scope.mode === "pass") {
+            setAutoStatus(`合格镜出成片完成：本次 ${done} 镜，请逐镜复看最终画质`);
+            toast(`合格镜出成片完成：本次 ${done} 镜`, "ok");
+            break;
+          }
           if (scope.mode === "retry") {
             setAutoStatus(`不合格重跑完成：本次重跑 ${done} 镜，回列表复看后标合格/不合格`);
             toast(`不合格重跑完成：本次 ${done} 镜，记得复看`, "ok");
@@ -3987,7 +4011,9 @@ export function createStoryboardPanel(root, app) {
           break;
         }
         setAutoStatus(`第 ${done + 1} 镜：${unit.id} 写入中…`);
-        const result = await applyUnitCore(unit, { megapixels: AUTO_MEGAPIXELS });
+        const result = await applyUnitCore(unit, {
+          megapixels: autoFullQuality ? undefined : AUTO_MEGAPIXELS,
+        });
         if (!result.ok) {
           const reason = String(result.detail || "").trim() || "原因未知，看浏览器控制台";
           setCardMessage(unit, reason, "err");
@@ -4064,6 +4090,12 @@ export function createStoryboardPanel(root, app) {
         }
         // 重跑的不合格镜出了新片：回到「待检」，等人工再验一遍
         if (state.verdict[unit.id] === "fail") delete state.verdict[unit.id];
+        // 合格镜出了成片：回到「待检」，别让旧结论盖住新画面；
+        // 名单必须在这一镜成功后立刻摘掉，否则同一个编号会被反复取到
+        if (autoPassIds) {
+          if (state.verdict[unit.id] === "pass") delete state.verdict[unit.id];
+          autoPassIds = autoPassIds.filter((id) => id !== unit.id);
+        }
         persist();
         // 生成成功才算这一镜完成，避免中途停止时把没出片的镜标成已完成
         markApplied(unit, true);
@@ -4092,11 +4124,15 @@ export function createStoryboardPanel(root, app) {
     } finally {
       autoRunning = false;
       autoRetryIds = null;
+      autoPassIds = null;
       applying = false;
       if (el.next) el.next.disabled = false;
       if (el.auto) el.auto.checked = false;
       if (megapixelsBackup != null) setResolutionMegapixels(app, megapixelsBackup);
       if (!draftBefore && state.draftBase) finishDraft();
+      // 出成片前临时退掉的草稿，跑完恢复成用户原来的草稿状态
+      if (autoFullQuality && draftBefore && !state.draftBase) enterDraft(true);
+      autoFullQuality = false;
       if (autoStopRequested) setAutoStatus(`已停止（完成 ${done} 镜）`);
       // 跑完把卡片重画一遍：重跑过的镜要从「不合格」回到「待检」
       renderList();
@@ -4906,6 +4942,24 @@ export function createStoryboardPanel(root, app) {
 
   el["draft"].addEventListener("click", () => enterDraft());
   el["final"].addEventListener("click", () => finishDraft());
+
+  // 两段式出片：草稿全部跑完、在总清单里标好合格后，一次性按成片画质重跑这些镜
+  el["pass-final"].addEventListener("click", () => {
+    if (autoRunning) {
+      toast("自动模式正在跑，等这一轮结束再出成片", "err");
+      return;
+    }
+    const ids = (state.doc ? state.doc.units : [])
+      .filter((unit) => state.verdict[unit.id] === "pass")
+      .map((unit) => unit.id);
+    if (!ids.length) {
+      toast("还没有标记合格的单元：先在总清单里点「✓」", "err");
+      return;
+    }
+    runAuto({ ids, fullQuality: true }).catch((error) =>
+      toast(`出成片失败：${error && error.message ? error.message : error}`, "err")
+    );
+  });
 
   el["refresh-images"].addEventListener("click", () => {
     loadImageFiles();
