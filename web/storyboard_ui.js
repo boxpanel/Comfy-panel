@@ -49,6 +49,7 @@ import {
   readH3Plan,
   readResolutionSettings,
   readRuleBridgeText,
+  readSamplerSteps,
   referenceAudioSlots,
   referenceImageSlots,
   referenceVideoSlots,
@@ -59,6 +60,7 @@ import {
   setPlanResolution,
   setPromptText,
   setResolutionMegapixels,
+  setSamplerSteps,
   taggedReferenceTargets,
   wireTaggedReferences,
   writeFrameImage,
@@ -66,16 +68,16 @@ import {
   writePlanPromptPrefix,
   writeRuleBridgeText,
   writeH3Shot,
-} from "./storyboard_bridge.js?v=20261117h";
+} from "./storyboard_bridge.js?v=20261121a";
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.39 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.40 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
-// 全自动模式用的低画质像素档（960×544 左右），跑完会恢复原像素档
-const AUTO_MEGAPIXELS = 0.5;
+// 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
+const DRAFT_MEGAPIXELS = 0.25;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -478,7 +480,9 @@ function loadState() {
     // 面板日志：做过什么、哪里报错（刷新页面后还留着）
     log: Array.isArray(saved.log) ? saved.log.slice(-200) : [],
     draftBase:
-      saved.draftBase && typeof saved.draftBase === "object" && saved.draftBase.width && saved.draftBase.height
+      saved.draftBase &&
+      typeof saved.draftBase === "object" &&
+      (saved.draftBase.native === true || (saved.draftBase.width && saved.draftBase.height))
         ? saved.draftBase
         : null,
     settings: {
@@ -773,8 +777,8 @@ export function createStoryboardPanel(root, app) {
       </div>
       <div class="sb-frame" data-el="draft-row" hidden>
         <span class="label">草稿/成片</span>
-        <button class="sb-btn" data-el="draft" title="只在本次运行临时降到 640×360 + 6 步，不改分镜里的分辨率">草稿</button>
-        <button class="sb-btn" data-el="final" title="按分镜记录的分辨率与步数出成片">成片</button>
+        <button class="sb-btn" data-el="draft" title="只在本次运行降画质：计划链 640 宽 + 6 步；原生 Ref2V 0.25MP + 6 步">草稿</button>
+        <button class="sb-btn" data-el="final" title="按工作流原始画质与步数出片">成片</button>
         <button class="sb-btn" data-el="pass-final" title="把总清单里标为「合格」的单元按成片画质重新排队">合格镜出成片</button>
         <span class="sb-hint" data-el="draft-text"></span>
       </div>
@@ -1766,7 +1770,7 @@ export function createStoryboardPanel(root, app) {
   /** 草稿只在提交队列时替换参数：计划节点与工作流文件都不改 */
   function applyDraftToPayload(payload) {
     const draft = state.draftBase;
-    if (!draft || !payload || !payload.output) return;
+    if (!draft || draft.native || !payload || !payload.output) return;
     const planNode = getNodeById(app, draft.nodeId);
     if (!planNode) return;
     const entry = payload.output[String(planNode.id)];
@@ -1822,40 +1826,66 @@ export function createStoryboardPanel(root, app) {
     const row = el["draft-row"];
     if (!row) return;
     const info = getPlanResolution(app);
-    row.hidden = !info;
-    if (!info) return;
+    // 原生 Ref2V 没有计划节点：只要画幅或采样步数可写，也给草稿/成片开关
+    const native = info ? null : readResolutionSettings(app);
+    const samplerReady = !info && !native ? readSamplerSteps(app) != null : false;
+    row.hidden = !info && !native && !samplerReady;
+    if (!info && !native && !samplerReady) return;
     const base = state.draftBase;
-    if (base) {
-      const size = draftTargetSize(base);
-      el["draft-text"].textContent = `草稿（仅本次运行）${size.width}×${size.height} · ${DRAFT_STEPS} 步；分镜记录 ${info.width}×${info.height}`;
-    } else {
-      el["draft-text"].textContent = `成片 ${info.width}×${info.height}`;
+    if (info) {
+      el["draft-text"].textContent = base
+        ? `草稿（仅本次运行）${draftTargetSize(base).width}×${draftTargetSize(base).height} · ${DRAFT_STEPS} 步；分镜记录 ${info.width}×${info.height}`
+        : `成片 ${info.width}×${info.height}`;
+      return;
     }
+    const finalMegapixels = base && base.native ? base.megapixels : native ? native.megapixels : null;
+    const finalText = finalMegapixels != null ? `${finalMegapixels}MP` : "原画幅";
+    const draftText = native && native.megapixels != null ? `${DRAFT_MEGAPIXELS}MP` : "原画幅";
+    el["draft-text"].textContent = base
+      ? `草稿（仅本次运行）${draftText} · ${DRAFT_STEPS} 步；成片 ${finalText}`
+      : `成片 ${finalText}`;
   }
 
   function enterDraft(silent = false) {
-    const info = getPlanResolution(app);
-    if (!info) {
-      toast("当前工作流没有 H3 计划节点", "err");
-      return;
-    }
     if (state.draftBase) {
       if (!silent) toast("已经在草稿模式；点「成片」恢复按分镜原分辨率生成", "ok");
       return;
     }
-    const size = draftSize(info.width, info.height);
-    state.draftBase = {
-      nodeId: info.nodeId,
-      width: info.width,
-      height: info.height,
-      draftWidth: size.width,
-      draftHeight: size.height,
-    };
+    const info = getPlanResolution(app);
+    if (info) {
+      const size = draftSize(info.width, info.height);
+      state.draftBase = {
+        nodeId: info.nodeId,
+        width: info.width,
+        height: info.height,
+        draftWidth: size.width,
+        draftHeight: size.height,
+      };
+      persist();
+      renderPlanRow();
+      updateDraftRow();
+      if (silent) return;
+      toast(
+        `草稿模式：运行时临时 ${size.width}×${size.height}、${DRAFT_STEPS} 步；分镜里仍是 ${info.width}×${info.height}，确认后点「成片」`,
+        "ok"
+      );
+      return;
+    }
+    // 原生 Ref2V：只记录原值，真正降档在写镜时做，画布上的工作流不动
+    const native = readResolutionSettings(app);
+    const steps = readSamplerSteps(app);
+    if (!native && steps == null) {
+      toast("没有识别到画幅或采样步数控件，无法切草稿", "err");
+      return;
+    }
+    state.draftBase = { native: true, megapixels: native ? native.megapixels : null, steps };
     persist();
-    renderPlanRow();
+    updateDraftRow();
     if (silent) return;
     toast(
-      `草稿模式：运行时临时 ${size.width}×${size.height}、${DRAFT_STEPS} 步；分镜里仍是 ${info.width}×${info.height}，确认后点「成片」`,
+      `草稿模式：${native && native.megapixels != null ? `${DRAFT_MEGAPIXELS}MP` : "原画幅"}${
+        steps != null ? ` · ${DRAFT_STEPS} 步` : ""
+      }；确认后点「成片」`,
       "ok"
     );
   }
@@ -1864,6 +1894,20 @@ export function createStoryboardPanel(root, app) {
     const base = state.draftBase;
     if (!base) {
       toast("当前已经是成片模式", "ok");
+      return;
+    }
+    if (base.native) {
+      // 草稿写镜时把采样步数压到了 DRAFT_STEPS，退出草稿时要还原
+      if (base.steps != null) setSamplerSteps(app, base.steps);
+      state.draftBase = null;
+      persist();
+      updateDraftRow();
+      toast(
+        `成片模式：${base.megapixels != null ? `${base.megapixels}MP` : "原画幅"}${
+          base.steps != null ? ` · ${base.steps} 步` : ""
+        }`,
+        "ok"
+      );
       return;
     }
     // 兼容旧版草稿：如果计划节点被改过，这里恢复成记录值
@@ -3690,7 +3734,13 @@ export function createStoryboardPanel(root, app) {
     // 先接素材与上一镜视频：提示词里要按实际接上的 <Video 1> 写衔接说明
     const image = await applyVisualToUnit(unit);
     const prompt = applyPromptToUnit(unit);
-    const params = applyParamsToUnit(unit, options);
+    // 原生 Ref2V 的草稿状态记在 draftBase.native 里，写入时统一按草稿像素档/步数走
+    const nativeDraft = !!(state.draftBase && state.draftBase.native);
+    const params = applyParamsToUnit(unit, {
+      ...options,
+      megapixels: options.megapixels != null ? options.megapixels : nativeDraft ? DRAFT_MEGAPIXELS : null,
+      draftSteps: options.draftSteps != null ? options.draftSteps : nativeDraft ? DRAFT_STEPS : null,
+    });
     const fight = applyUnitFight(unit);
     const ok = prompt.ok && params.ok && image.ok;
     const detail = [image.message, prompt.message, params.message, fight.message].filter(Boolean).join("；");
@@ -3974,14 +4024,15 @@ export function createStoryboardPanel(root, app) {
       const names = scope.units.slice(0, 5).map((unit) => unit.id).join("、");
       logLine(`自动模式开始：只重跑不合格的 ${scope.units.length} 镜（${names}${scope.units.length > 5 ? "…" : ""}）`);
     } else {
-      logLine(`自动模式开始：共 ${state.doc.units.length} 镜，低画质 ${AUTO_MEGAPIXELS}MP`);
+      logLine(
+        `自动模式开始：共 ${state.doc.units.length} 镜，${
+          state.draftBase ? `草稿档（${DRAFT_STEPS} 步）` : "成片档"
+        }`
+      );
     }
     autoRetryIds = scope.mode === "retry" ? scope.units.map((unit) => unit.id) : null;
-    // 低画质：原生 Ref2V 临时降像素档；H3 计划工作流走草稿（6 步 + 640 宽）
-    const before = readResolutionSettings(app);
-    const megapixelsBackup = before ? before.megapixels : null;
+    // 画质听「草稿/成片」开关：开了草稿才降档，没开就是成片；出成片那一轮若原本在草稿，跑完再还原
     const draftBefore = !!state.draftBase;
-    if (planInfoSafe() && !draftBefore && !autoFullQuality) enterDraft();
     if (autoFullQuality && draftBefore) finishDraft();
     let done = 0;
     let lostRetries = 0;
@@ -4011,9 +4062,7 @@ export function createStoryboardPanel(root, app) {
           break;
         }
         setAutoStatus(`第 ${done + 1} 镜：${unit.id} 写入中…`);
-        const result = await applyUnitCore(unit, {
-          megapixels: autoFullQuality ? undefined : AUTO_MEGAPIXELS,
-        });
+        const result = await applyUnitCore(unit);
         if (!result.ok) {
           const reason = String(result.detail || "").trim() || "原因未知，看浏览器控制台";
           setCardMessage(unit, reason, "err");
@@ -4128,8 +4177,6 @@ export function createStoryboardPanel(root, app) {
       applying = false;
       if (el.next) el.next.disabled = false;
       if (el.auto) el.auto.checked = false;
-      if (megapixelsBackup != null) setResolutionMegapixels(app, megapixelsBackup);
-      if (!draftBefore && state.draftBase) finishDraft();
       // 出成片前临时退掉的草稿，跑完恢复成用户原来的草稿状态
       if (autoFullQuality && draftBefore && !state.draftBase) enterDraft(true);
       autoFullQuality = false;

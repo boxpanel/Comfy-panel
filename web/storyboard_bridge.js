@@ -5,7 +5,7 @@
 const TEXT_WIDGETS = ["text", "prompt", "string"];
 
 /** 桥接模块构建号：面板徽标里一起显示，用来确认浏览器加载的是新代码 */
-export const BRIDGE_BUILD = "20261117h";
+export const BRIDGE_BUILD = "20261121a";
 
 /** 只返回真正参与执行的工作流节点（排除静音 mode 2 与旁路 mode 4） */
 export function getNodes(app) {
@@ -2184,6 +2184,26 @@ export function setResolutionMegapixels(app, megapixels) {
   return ok;
 }
 
+/** 读采样器当前步数；没有采样器或没有 steps 控件时返回 null */
+export function readSamplerSteps(app) {
+  const sampler = autoDetectTargets(app).sampler;
+  const widget = sampler ? getWidget(sampler, "steps") : null;
+  if (!widget) return null;
+  const value = Number(widget.value);
+  return Number.isFinite(value) ? value : null;
+}
+
+/** 改采样器步数（原生 Ref2V 的草稿档用） */
+export function setSamplerSteps(app, steps) {
+  const sampler = autoDetectTargets(app).sampler;
+  if (!sampler) return false;
+  const value = Math.max(1, Math.round(Number(steps) || 0));
+  if (!value) return false;
+  const ok = setWidget(sampler, "steps", value);
+  if (ok) markDirty(app, sampler);
+  return ok;
+}
+
 /** 把单元的档位参数写入工作流 */
 export function applyUnitParams(app, unit, settings, targets, options = {}) {
   const raw = unit && unit.params;
@@ -2232,11 +2252,16 @@ export function applyUnitParams(app, unit, settings, targets, options = {}) {
     // 时长由这条工作流自己的控件换算帧数，面板不写帧；帧率仍要是 24，否则音频时钟会漂
     const fpsFixed = ensureH3Fps(app);
     if (fpsFixed.length) pushDone(`帧率修正为 24（节点 ${fpsFixed.join("、")}）`);
-    // 画面比例按分镜档位的宽高算，像素默认锁 1.5MP；自动模式会传更低的档
+    // 画面比例按分镜档位的宽高算，像素默认锁 1.5MP；草稿模式会传更低的档
     const lockMegapixels = Number(options.megapixels) > 0 ? Number(options.megapixels) : H3_MEGAPIXELS;
     const resolution = writeResolution(app, params.width, params.height, lockMegapixels);
     if (resolution.ok) pushDone(`画幅 ${resolution.label}`);
     else missing.push("画幅");
+    // 草稿档：临时把采样步数压低，成片时不传 draftSteps，工作流原步数不动
+    if (Number(options.draftSteps) > 0 && sampler && setWidget(sampler, "steps", Math.round(options.draftSteps))) {
+      markDirty(app, sampler);
+      pushDone(`草稿 ${Math.round(options.draftSteps)} 步`);
+    }
     if (sampler && setWidget(sampler, "seed", seed)) {
       markDirty(app, sampler);
       pushDone(`种子 ${seed}`);
