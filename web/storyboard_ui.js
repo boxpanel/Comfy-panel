@@ -12,8 +12,9 @@ import {
   parseAssetNames,
   parseFrameName,
   parseStoryboard,
+  parseVoiceDialoguePack,
   summarize,
-} from "./storyboard_parser.js?v=20261120b";
+} from "./storyboard_parser.js?v=20261122";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -51,6 +52,7 @@ import {
   readResolutionSettings,
   readRuleBridgeText,
   readSamplerSteps,
+  readTransitionStep,
   referenceAudioSlots,
   referenceImageSlots,
   referenceVideoSlots,
@@ -62,6 +64,7 @@ import {
   setPromptText,
   setResolutionMegapixels,
   setSamplerSteps,
+  setTransitionStep,
   taggedReferenceTargets,
   wireTaggedReferences,
   writeFrameImage,
@@ -69,13 +72,13 @@ import {
   writePlanPromptPrefix,
   writeRuleBridgeText,
   writeH3Shot,
-} from "./storyboard_bridge.js?v=20261121d";
+} from "./storyboard_bridge.js?v=20261123a";
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.51 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.52 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -625,7 +628,7 @@ export function createStoryboardPanel(root, app) {
       <summary>怎么用（三步）</summary>
       <div class="sb-box-body">
         <ol>
-          <li><b>导入分镜</b>：点右上角「导入分镜」选 .md / .zip / 多个文件，或点「文件夹」选整个提示词包目录，也可以把文件 / 文件夹直接拖进来；豆包提示词包优先选 <b>08-分镜表.json</b>，也可以一次多选 08 / 06 / 04（连同 03 素材表），镜数不一致时以 08 为准。</li>
+          <li><b>导入分镜</b>：点右上角「导入分镜」选 .md / .zip / 多个文件，或点「文件夹」选整个提示词包目录，也可以把文件 / 文件夹直接拖进来；豆包提示词包优先选 <b>09-分镜表.json</b>，也可以一次多选 09 / 07 / 05（连同 03 素材表、04 声音与对白表），镜数不一致时以 09 为准。</li>
           <li><b>导入素材库</b>：点「素材库」选母库文件夹；文件名里带 S-01 / R-01 / S02-U01 的会自动对上。</li>
           <li><b>打开工作流</b>：在 ComfyUI 里打开你要用的图生视频工作流（面板顶部变绿就说明认到了）。</li>
           <li><b>按顺序做</b>：点下面的「应用下一镜」，素材会自动上传并填好，再回 ComfyUI 点「运行」；出完 4 条再回来点下一镜。</li>
@@ -633,12 +636,12 @@ export function createStoryboardPanel(root, app) {
         <div class="sb-hint">看不懂参数没关系，全部已经按手册的 A／B／C 档算好，按钮会自动填进工作流。</div>
         <div class="sb-hint">注意：合成好的首帧图，文件名带上镜号（如 S02-U01.png）会被优先当作这一镜的首帧。</div>
         <div class="sb-hint">格式很宽松：标题 # 可省略、竖线 ｜ 或 / 都行、S02U01 也认；只要出现镜号就能拆出镜头。</div>
-        <div class="sb-hint">提示词包：08 JSON 字段最全；06 CSV 按 12 列表头对列；04 TXT 只带时长/机位与英文提示词。视频提示词末尾的 Negative 段会自动拆出来单独显示。</div>
+        <div class="sb-hint">提示词包：09 JSON 字段最全；07 CSV 按表头对列；05 TXT 只带时长/机位与英文提示词；12 结构化成片提示词是六段式单元稿；04 声音与对白表会按镜号并进台词。视频提示词末尾的 Negative 段会自动拆出来单独显示。</div>
       </div>
     </details>
 
     <div class="sb-paste" data-el="paste" hidden>
-      <textarea data-el="text" spellcheck="false" placeholder="粘贴分镜执行卡（Markdown），或提示词包 JSON / CSV / 04-视频提示词.txt"></textarea>
+      <textarea data-el="text" spellcheck="false" placeholder="粘贴分镜执行卡（Markdown），或提示词包 JSON / CSV / 05-视频提示词.txt"></textarea>
       <div class="sb-paste-actions">
         <button class="sb-btn primary" data-el="parse">解析</button>
         <button class="sb-btn" data-el="clear">清空</button>
@@ -1906,11 +1909,12 @@ export function createStoryboardPanel(root, app) {
     // 原生 Ref2V：只记录原值，真正降档在写镜时做，画布上的工作流不动
     const native = readResolutionSettings(app);
     const steps = readSamplerSteps(app);
+    const transitionStep = readTransitionStep(app);
     if (!native && steps == null) {
       toast("没有识别到画幅或采样步数控件，无法切草稿", "err");
       return;
     }
-    state.draftBase = { native: true, megapixels: native ? native.megapixels : null, steps };
+    state.draftBase = { native: true, megapixels: native ? native.megapixels : null, steps, transitionStep };
     state.quality = "draft";
     persist();
     updateDraftRow();
@@ -1937,6 +1941,10 @@ export function createStoryboardPanel(root, app) {
     if (base.native) {
       // 草稿写镜时把采样步数压到了 DRAFT_STEPS，退出草稿时要还原
       if (base.steps != null) setSamplerSteps(app, base.steps);
+      // SelfLift 的 transition_step 草稿档也压过，一并还原
+      if (base.transitionStep != null) setTransitionStep(app, base.transitionStep);
+      // 草稿档把像素档压到了 DRAFT_MEGAPIXELS，退出时还原到进草稿前的像素档
+      if (base.megapixels != null) setResolutionMegapixels(app, base.megapixels);
       state.draftBase = null;
       persist();
       updateDraftRow();
@@ -4340,29 +4348,32 @@ export function createStoryboardPanel(root, app) {
     }
   }
 
-  // 提示词包里的三类镜表 + 几张附表，按内容认；文件名前缀作兜底（00~09 是出包端固定编号）
-  const PACK_KIND_LABEL = { units: "11 单元稿", json: "08 JSON", csv: "06 CSV", txt: "04 TXT", shots: "01 分镜", assets: "03 素材", frames: "02 首尾帧" };
+  // 提示词包里的三类镜表 + 几张附表，按内容认；文件名前缀作兜底（00~12 是出包端固定编号）
+  const PACK_KIND_LABEL = { units: "12 单元稿", json: "09 JSON", csv: "07 CSV", txt: "05 TXT", shots: "01 分镜", assets: "03 素材", frames: "02 首尾帧", voicedlg: "04 声音与对白" };
   const PACK_FILE_KIND = {
     "00": "doc",
     "01": "shots",
     "02": "frames",
     "03": "assets",
-    "04": "txt",
-    "05": "negative",
-    "06": "csv",
-    "07": "discussion",
-    "08": "json",
-    "09": "frames",
+    "04": "voicedlg",
+    "05": "txt",
+    "06": "negative",
+    "07": "csv",
+    "08": "discussion",
+    "09": "json",
+    "10": "frames",
+    "12": "units",
   };
   // 附表单独导入时只提示用途，不报「没找到镜号」
   const PACK_KIND_HINT = {
-    assets: "03 是素材表：请和 08 / 01 一起多选导入，用来补素材名称",
-    frames: "02 是首尾帧表：首尾帧已随 08 / 01 进卡，不用单独导入",
-    negative: "05 是负向提示词：请导入 08 或 01，负向会一并读入",
+    assets: "03 是素材表：请和 09 / 12 一起多选导入，用来补素材名称",
+    frames: "02 是首尾帧表：首尾帧已随 09 / 12 进卡，不用单独导入",
+    negative: "06 是负向提示词：请导入 09 或 12，负向会一并读入",
     doc: "00 是项目说明，不含分镜",
-    discussion: "07 是讨论记录，不含分镜",
-    voice: "04 是音色清单：音色已写在 01 每个单元的「音色绑定」行，不用单独导入",
-    manifest: "02 是单元切分清单：只用来核对镜数，不参与导入",
+    discussion: "08 是讨论记录，不含分镜",
+    voicedlg: "04 是声音与对白表：请和 09 / 12 一起多选导入，台词会按镜号并进对应卡",
+    voice: "这是音色清单：音色已写在单元提示词的「音色绑定」行，不用单独导入",
+    manifest: "这是单元切分清单：只用来核对镜数，不参与导入",
   };
 
   // ---------- 压缩包 ----------
@@ -4472,12 +4483,13 @@ export function createStoryboardPanel(root, app) {
   function packKindOf(name, text) {
     const lower = String(name || "").toLowerCase();
     const head = String(text || "").slice(0, 6000);
-    // 先按正文认：出包端的编号含义会变（有的包里 04 是声音清单，不是 04 镜表），
+    // 先按正文认：出包端的编号含义会变（有的包里 04 是声音对白表，不是 04 镜表），
     // 只按前缀判会把附表当主源，整包解析出 0 镜
-    if (/^##\s+U\d{3}\s*[·・]\s*镜头/m.test(head) && /^subject_definitions:\s*$/m.test(head)) return "units";
+    if (/^#{2,4}\s+(?:U\d{3}|镜\s*\d{3})\s*[·・]\s*镜头/m.test(head) && /^subject_definitions:/m.test(head)) return "units";
     if (/\.json$/i.test(lower) || /^\uFEFF?\s*\{/.test(head)) return "json";
     if (/\.csv$/i.test(lower) || (/镜头号/.test(head.split(/\r?\n/, 1)[0] || "") && head.includes(","))) return "csv";
     if (/【镜头\s*\d+】/.test(head)) return "txt";
+    if (/^##\s*三、逐句对白总表/m.test(head)) return "voicedlg";
     if (/^#{1,3}\s*声音素材清单/m.test(head)) return "voice";
     if (/^#{1,3}\s*(?:素材提示词|素材清单)/m.test(head) || /^###\s*(?:ST|S|C|P|E|R|T|G)-\d{2}\s*[·・]/m.test(head)) return "assets";
     if (/首帧提示词\s*[（(]/.test(head)) return "frames";
@@ -4488,7 +4500,48 @@ export function createStoryboardPanel(root, app) {
     return "";
   }
 
-  /** 多选导入：以 08 JSON 为主源，其余文件只做镜数核对 / 素材名称补全 */
+  /** 一个单元覆盖的全片镜头号：六段式单元用 shotFrom..shotTo，单镜卡用 label 转数字 */
+  function unitShotNumbers(unit) {
+    if (unit.shotFrom != null && unit.shotTo != null) {
+      const out = [];
+      for (let no = unit.shotFrom; no <= unit.shotTo; no += 1) out.push(no);
+      return out;
+    }
+    const no = parseInt(String(unit && unit.label), 10);
+    return Number.isFinite(no) ? [no] : [];
+  }
+
+  /** 把 04 声音与对白表的台词按全片镜号并进 units 的「对白」栏（整句去重） */
+  function mergeVoiceDialogue(units, pack) {
+    if (!pack || !Array.isArray(pack.lines) || !pack.lines.length) return 0;
+    const byShot = new Map();
+    pack.lines.forEach((line) => {
+      if (!byShot.has(line.shotNo)) byShot.set(line.shotNo, []);
+      byShot.get(line.shotNo).push(line);
+    });
+    let added = 0;
+    units.forEach((unit) => {
+      const hit = [];
+      unitShotNumbers(unit).forEach((no) => {
+        if (byShot.has(no)) hit.push(...byShot.get(no));
+      });
+      if (!hit.length) return;
+      const existing = new Set(
+        String(unit.audio || "")
+          .split(/[；;]/)
+          .map((s) => s.trim())
+          .filter(Boolean)
+      );
+      const spoken = hit.map((line) => `${line.character}：「${line.text}」`);
+      const fresh = spoken.filter((s) => !existing.has(s));
+      if (!fresh.length) return;
+      unit.audio = [String(unit.audio || "").trim(), ...fresh].filter(Boolean).join("；");
+      added += fresh.length;
+    });
+    return added;
+  }
+
+  /** 多选导入：以 09 JSON 为主源，其余文件只做镜数核对 / 素材名称补全 / 台词并入 */
   async function importFiles(fileList) {
     const raw = Array.from(fileList || []);
     // 文件夹里会混着图片：只留文本镜表 + zip
@@ -4549,7 +4602,7 @@ export function createStoryboardPanel(root, app) {
       logLine(`已忽略非镜表：${ignored.map((entry) => entry.file.name).join("、")}`, "info");
     }
     if (!usable.length) {
-      toast(PACK_KIND_HINT[entries[0].kind] || "选中的文件里没有镜表（08 / 06 / 04 / 01）", "info");
+      toast(PACK_KIND_HINT[entries[0].kind] || "选中的文件里没有镜表（09 / 07 / 05 / 12 / 01）", "info");
       return;
     }
 
@@ -4582,7 +4635,7 @@ export function createStoryboardPanel(root, app) {
       }
     }
 
-    // 03 素材表：补「编号 → 类型·名称」，08 自带 assets 时以 08 为准
+    // 03 素材表：补「编号 → 类型·名称」，09 自带 assets 时以 09 为准
     const assetEntry = entries.find((entry) => entry.kind === "assets");
     if (assetEntry && state.doc) {
       const names = parseAssetNames(assetEntry.text);
@@ -4602,8 +4655,20 @@ export function createStoryboardPanel(root, app) {
         renderList();
       }
     }
+    // 04 声音与对白表：台词按全片镜号并进对应卡的「对白」栏
+    const voiceEntry = entries.find((entry) => entry.kind === "voicedlg");
+    if (voiceEntry && state.doc) {
+      const pack = parseVoiceDialoguePack(voiceEntry.text);
+      if (pack) {
+        const added = mergeVoiceDialogue(state.doc.units, pack);
+        if (added) {
+          renderList();
+          logLine(`已从 04 声音与对白表并入 ${added} 句台词`, "ok");
+        }
+      }
+    }
     if (entries.some((entry) => entry.kind === "frames")) {
-      logLine("02 首尾帧表暂不单独导入（首尾帧已随 08 / 01 进卡）", "info");
+      logLine("02 首尾帧表暂不单独导入（首尾帧已随 09 / 12 进卡）", "info");
     }
   }
 

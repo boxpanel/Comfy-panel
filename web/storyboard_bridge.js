@@ -5,7 +5,7 @@
 const TEXT_WIDGETS = ["text", "prompt", "string"];
 
 /** 桥接模块构建号：面板徽标里一起显示，用来确认浏览器加载的是新代码 */
-export const BRIDGE_BUILD = "20261121d";
+export const BRIDGE_BUILD = "20261123a";
 
 /** 只返回真正参与执行的工作流节点（排除静音 mode 2 与旁路 mode 4） */
 export function getNodes(app) {
@@ -2243,6 +2243,28 @@ export function setSamplerSteps(app, steps) {
   return ok;
 }
 
+/** 读 SelfLift 的 transition_step；没有这个控件时返回 null */
+export function readTransitionStep(app) {
+  const node = getNodes(app).find((n) => hasWidget(n, "transition_step"));
+  const widget = node ? getWidget(node, "transition_step") : null;
+  if (!widget) return null;
+  const value = Number(widget.value);
+  return Number.isFinite(value) ? value : null;
+}
+
+/** 改 SelfLift 的 transition_step（草稿档压低、退出草稿还原用） */
+export function setTransitionStep(app, value) {
+  let ok = false;
+  for (const node of getNodes(app)) {
+    if (!hasWidget(node, "transition_step")) continue;
+    if (setWidget(node, "transition_step", value)) {
+      markDirty(app, node);
+      ok = true;
+    }
+  }
+  return ok;
+}
+
 /** 把单元的档位参数写入工作流 */
 export function applyUnitParams(app, unit, settings, targets, options = {}) {
   const raw = unit && unit.params;
@@ -2297,10 +2319,19 @@ export function applyUnitParams(app, unit, settings, targets, options = {}) {
     if (resolution.ok) pushDone(`画幅 ${resolution.label}`);
     else missing.push("画幅");
     // 草稿档：临时把采样步数压低，成片时不传 draftSteps，工作流原步数不动
+    const draftSteps = Math.round(Number(options.draftSteps) || 0);
     const stepsNode = findStepsNode(app);
-    if (Number(options.draftSteps) > 0 && stepsNode && setWidget(stepsNode, "steps", Math.round(options.draftSteps))) {
+    if (draftSteps > 0 && stepsNode && setWidget(stepsNode, "steps", draftSteps)) {
       markDirty(app, stepsNode);
-      pushDone(`草稿 ${Math.round(options.draftSteps)} 步`);
+      pushDone(`草稿 ${draftSteps} 步`);
+    }
+    // SelfLift 要求 1 ≤ transition_step ≤ steps-1；草稿 6 步时默认 transition_step=6 会越界，同步压低
+    if (draftSteps > 0) {
+      const current = readTransitionStep(app);
+      if (current != null) {
+        const clamped = Math.max(1, Math.min(draftSteps - 1, current));
+        if (setTransitionStep(app, clamped)) pushDone(`SelfLift 过渡步 ${clamped}`);
+      }
     }
     if (sampler && setWidget(sampler, "seed", seed)) {
       markDirty(app, sampler);

@@ -557,22 +557,29 @@ const PROMPT_SECTIONS = [
   "overall_soundscape",
   "non_diegetic_music",
 ];
-// summary 前缀：纯参考图生成，或参考图 + 音色参考
-const SUMMARY_PREFIX_RE = /^\[reference generation(?:\s*\+\s*audio reference)?\]\s*/i;
+// summary 前缀：出包端会写 [reference generation] / [keyframe completion] / [video continuation] 等，
+// 也可能整段不写前缀；这里只剥掉任意方括号标签，不限定种类
+const SUMMARY_PREFIX_RE = /^\[[^\]\n]{1,120}\]\s*/;
 const STRUCT_CODE_RE = "(?:ST|T-P|T|RA|R|C|S|P|G|E|A|V)-\\d{2}[a-zA-Z]?(?:-E\\d)?";
 
-/** 六段式正文 → { subject_definitions, summary, … } */
+/** 六段式正文 → { subject_definitions, summary, … }（段名后可以直接跟正文，也可以换行） */
 function promptSectionsOf(body) {
   const marks = [];
-  const re = new RegExp(`^(${PROMPT_SECTIONS.join("|")}):\\s*$`, "gm");
+  const re = new RegExp(`^(${PROMPT_SECTIONS.join("|")}):[ \\t]*(.*)$`, "gm");
   let match;
   while ((match = re.exec(body))) {
-    marks.push({ key: match[1], start: match.index, end: match.index + match[0].length });
+    marks.push({
+      key: match[1],
+      start: match.index,
+      end: match.index + match[0].length,
+      inline: String(match[2] || "").trim(),
+    });
   }
   const sections = {};
   marks.forEach((mark, index) => {
     const stop = index + 1 < marks.length ? marks[index + 1].start : body.length;
-    sections[mark.key] = body.slice(mark.end, stop).trim();
+    const rest = body.slice(mark.end, stop).trim();
+    sections[mark.key] = [mark.inline, rest].filter(Boolean).join("\n").trim();
   });
   return sections;
 }
@@ -632,17 +639,34 @@ function parseAudioRetention(section) {
   return found;
 }
 
-/** subject_definitions 里的 `<Subject N> … from <Picture K>` */
+/** subject_definitions 里的 `<Subject N> …` 定义。兼容两种出包格式：
+ *  旧：每行一个 `<Subject N> is Wesley (卫斯理) from <Picture K>, …`
+ *  新：多个 `<Subject N> is 中文名 / english desc` 挤在同一行，`<Picture N>` 单独声明不再用 from 关联 */
 function parseSubjectDefinitions(section) {
   const found = [];
-  const re = /^<Subject\s+(\d+)>\s+is\s+([^\n,]+?)(?:\s*\(([^)]*)\))?\s+from\s+<Picture\s+(\d+)>/gmi;
+  const text = String(section || "");
   let match;
-  while ((match = re.exec(String(section || "")))) {
+  const oldRe = /^<Subject\s+(\d+)>\s+is\s+([^\n,]+?)(?:\s*\(([^)]*)\))?\s+from\s+<Picture\s+(\d+)>/gmi;
+  while ((match = oldRe.exec(text))) {
     found.push({
       subject: Number(match[1]),
       enName: match[2].trim(),
       name: (match[3] || match[2]).trim(),
       picture: Number(match[4]),
+    });
+  }
+  if (found.length) return found;
+  const newRe = /<Subject\s+(\d+)>\s+is\s+([\s\S]*?)(?=<Subject\s+\d+>\s+is|<Picture\s+\d+>\s+is|$)/g;
+  while ((match = newRe.exec(text))) {
+    const desc = String(match[2] || "").trim().replace(/[,.]\s*$/, "");
+    const slash = desc.indexOf("/");
+    const head = (slash > 0 ? desc.slice(0, slash) : desc).trim().replace(/[,.]\s*$/, "");
+    const enName = (slash > 0 ? desc.slice(slash + 1) : desc).trim().replace(/[,.]\s*$/, "");
+    found.push({
+      subject: Number(match[1]),
+      enName,
+      name: head || enName,
+      picture: 0,
     });
   }
   return found;
@@ -675,18 +699,20 @@ function mergeAudioRefs(voice, defs, retention) {
 function parseStructuredPromptPack(text) {
   const unitHeads = [];
   let match;
-  const unitRe = /^##\s+(U\d{3})\s*[·・]\s*镜头\s*(\d+)\s*[—–-]\s*(\d+)\s*$/gm;
+  // 单元标题有三种出包写法：旧包 `## U001 · 镜头 01—04`、样例新包 `### U001 · 镜头 01—01`、
+  // 正式 zip 包 `## 镜 001 · 镜头 01—06`（「镜」+ 三位数，无 U 前缀）；统一归一成 U 编号
+  const unitRe = /^#{2,4}\s+(?:U(\d{3})|镜\s*(\d{3}))\s*[·・]\s*镜头\s*(\d+)\s*[—–-]\s*(\d+)\s*$/gm;
   while ((match = unitRe.exec(text))) {
     unitHeads.push({
       index: match.index,
       end: match.index + match[0].length,
-      uid: match[1],
-      from: Number(match[2]),
-      to: Number(match[3]),
+      uid: `U${match[1] || match[2]}`,
+      from: Number(match[3]),
+      to: Number(match[4]),
     });
   }
   if (!unitHeads.length) {
-    const shotRe = /^##\s+镜头\s*(\d+)\s*(?:[（(]([^）)]*)[）)])?\s*$/gm;
+    const shotRe = /^#{1,4}\s+镜头\s*(\d+)\s*(?:[（(]([^）)]*)[）)])?\s*$/gm;
     while ((match = shotRe.exec(text))) {
       const heading = parseUnitHeading(match[0]);
       if (!heading) continue;
@@ -719,7 +745,7 @@ function parseStructuredPromptPack(text) {
     let body = (fence ? fence[1] : block).trim();
     // 无代码围栏时，从六段式的第一段开始，去掉场景/素材绑定/音色绑定等头部行
     if (!fence) {
-      const start = body.search(/^subject_definitions:\s*$/m);
+      const start = body.search(/^subject_definitions:/m);
       if (start > 0) body = body.slice(start).trim();
     }
     const sections = promptSectionsOf(body);
@@ -752,14 +778,24 @@ function parseStructuredPromptPack(text) {
     const summaryText = String(sections.summary || "").trim();
     const prefix = summaryText.match(SUMMARY_PREFIX_RE);
     const summaryBody = prefix ? summaryText.slice(prefix[0].length).trim() : summaryText;
+    // 12-结构化成片提示词.md 没有「名义 20s ｜ 对齐 481 帧」元信息行，时长写在 summary 首句：
+    //   "This 5.0-second live-action shot …" / "Total duration 16.0 seconds."
+    if (!nominal) {
+      const found =
+        summaryText.match(/(?:total\s+)?duration\s*[：:]?\s*(\d+(?:\.\d+)?)\s*seconds?/i) ||
+        summaryText.match(/(\d+(?:\.\d+)?)\s*[- ]\s*seconds?\b/i) ||
+        summaryText.match(/(\d+(?:\.\d+)?)-second/i);
+      nominal = found ? Number(found[1]) : 5 * Math.max(1, head.to - head.from + 1);
+    }
 
     const id = head.uid;
     const label = head.heading ? head.heading.label : String(head.from).padStart(2, "0");
 
-    if (!prefix) warnings.push(`${id} summary 缺 [reference generation + audio reference] 前缀`);
     const missing = PROMPT_SECTIONS.filter((key) => !sections[key]);
     if (missing.length) warnings.push(`${id} 六段式缺 ${missing.join("、")}`);
-    if (new RegExp(`(?:^|[\\s(])${STRUCT_CODE_RE}`, "m").test(body)) {
+    // 只查 summary / detailed_description 这两段「正文」；subject_definitions 里标注素材编号是正常写法
+    const bodyForAssetCheck = [sections.summary, sections.detailed_description].filter(Boolean).join("\n");
+    if (new RegExp(`(?:^|[\\s(])${STRUCT_CODE_RE}`, "m").test(bodyForAssetCheck)) {
       warnings.push(`${id} 正文出现素材编号，应只用 <Subject N>`);
     }
     const defined = new Set(subjects.map((item) => item.subject));
@@ -776,6 +812,9 @@ function parseStructuredPromptPack(text) {
       id,
       scene: 1,
       label,
+      // 单元覆盖的全片镜号区间：04 声音与对白表按镜号并台词时用
+      shotFrom: head.from,
+      shotTo: head.to,
       sceneName: meta ? meta[1].trim() : title,
       durationText: nominal ? `${nominal} 秒` : "",
       duration: nominal,
@@ -839,7 +878,7 @@ function parseStructuredPromptPack(text) {
 export function parseStoryboard(rawText) {
   const text = unescapeMd(String(rawText || "")).replace(/\r\n?/g, "\n");
   // 六段式单元包：正文只按 <Subject N> / <Audio N> 解析，素材编号只认「素材绑定」行
-  if (/^subject_definitions:\s*$/m.test(text)) {
+  if (/^subject_definitions:/m.test(text)) {
     const structured = parseStructuredPromptPack(text);
     if (structured) return structured;
   }
@@ -1538,4 +1577,50 @@ export function parseFrameName(name) {
   match = /^(S\d{2}-U\d{2})_frame\.(png|jpe?g|webp)$/i.exec(file);
   if (match) return { unit: match[1].toUpperCase(), kind: "first", version: 1 };
   return null;
+}
+
+/**
+ * 解析「04-声音与对白表.md」（新增入口）。
+ * 识别特征：## 三、逐句对白总表
+ * 表格列（固定 9 列）：
+ *   # | 镜头窗（全片） | 镜内起点 | 镜头 | 角色 | 音色 | 台词 | 声源 | 收尾点（全片）
+ * 「镜头」列是全片镜头号（「镜头 3」空格分隔，不补零）。
+ * @returns {{title:string, lines:Array<{no:number,window:string,innerStart:string,shotNo:number,character:string,voice:string,text:string,source:string,endAt:string}>}|null}
+ */
+export function parseVoiceDialoguePack(text) {
+  const src = String(text || "").replace(/\r\n?/g, "\n");
+  if (!/^##\s*三、逐句对白总表/m.test(src)) return null;
+  const titleMatch = src.match(/^#\s+(.+)$/m);
+  const title = titleMatch ? titleMatch[1].trim() : "声音与对白表";
+
+  // 只处理「三、逐句对白总表」之后的表格行，前面的一、二节是音色速查/档案，不参与对白
+  const sectionStart = src.search(/^##\s*三、逐句对白总表/m);
+  const rest = src.slice(sectionStart);
+
+  const lines = [];
+  for (const rawLine of rest.split("\n")) {
+    if (!/^\s*\|/.test(rawLine)) continue;
+    const cells = splitRow(rawLine);
+    if (isSeparatorRow(cells)) continue;
+    if (cells.length < 7) continue;
+    const no = String(cells[0] || "").trim();
+    if (no === "#" || !/^\d+$/.test(no)) continue; // 表头行或非数据行
+    const shotCell = String(cells[3] || "").trim();
+    const shotNo = Number((shotCell.match(/\d+/) || [])[0]);
+    const text = String(cells[6] || "").trim();
+    if (!shotNo || !text) continue;
+    lines.push({
+      no: Number(no),
+      window: String(cells[1] || "").trim(),
+      innerStart: String(cells[2] || "").trim(),
+      shotNo,
+      character: String(cells[4] || "").trim(),
+      voice: String(cells[5] || "").trim(),
+      text,
+      source: String(cells[7] || "").trim(),
+      endAt: String(cells[8] || "").trim(),
+    });
+  }
+  if (!lines.length) return null;
+  return { title, lines };
 }
