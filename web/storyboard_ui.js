@@ -13,7 +13,7 @@ import {
   parseFrameName,
   parseVoiceDialoguePack,
   summarize,
-} from "./storyboard_parser.js?v=20261124j";
+} from "./storyboard_parser.js?v=20261124k";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -77,7 +77,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.62 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.63 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -759,7 +759,7 @@ export function createStoryboardPanel(root, app) {
         <div><b>A 档 · 静</b>：空教室、道具、静物这类没有人大幅动的镜头。</div>
         <div><b>B 档 · 人像（默认）</b>：单人或两人说话、近景中景，手册里的默认档。</div>
         <div><b>C 档 · 动</b>：多人、翻倒、挣扎、跑动，动作多、步数多一点。</div>
-        <div><b>步数</b>：12 是画质和速度的平衡点；24 给动作多的镜头。</div>
+        <div><b>步数</b>：10 是画质和速度的平衡点；24 给动作多的镜头。</div>
         <div><b>CFG</b>：4.5 表示“听话程度”，一般不用动。</div>
         <div><b>shift</b>：画面硬不硬，静 5、人像 6、动作 7。</div>
         <div><b>降噪</b>：图生视频必须 1.0，低了等于没动。</div>
