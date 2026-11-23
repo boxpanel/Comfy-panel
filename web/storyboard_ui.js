@@ -13,7 +13,7 @@ import {
   parseFrameName,
   parseVoiceDialoguePack,
   summarize,
-} from "./storyboard_parser.js?v=20261124b";
+} from "./storyboard_parser.js?v=20261124c";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -77,7 +77,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.54 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.55 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -586,6 +586,16 @@ export function createStoryboardPanel(root, app) {
     // raw 可能是 JSON / CSV / txt / 六段式，统一走内容识别；刷新后素材补丁再叠回去
     state.doc = parseAnyStoryboard(state.raw);
     applyStoredUnitAssets();
+    // 载入诊断：整份分镜一个素材编号都没有时，把原因写进日志，免得只看到「本批素材 0 行」
+    const units = state.doc.units || [];
+    if (units.length && units.every((unit) => !(unit.assets || []).length)) {
+      state.log.push({
+        at: Date.now(),
+        kind: "warn",
+        text: "这份分镜没有解析出任何素材编号：单元里的「素材绑定」是空的。请连 09-分镜表.json 一起导入（面板会按镜号补编号），素材库的图才能和镜头对上",
+      });
+      if (state.log.length > 200) state.log.splice(0, state.log.length - 200);
+    }
   }
 
   /** 把持久化的「按镜号补出来的素材编号」叠回单元 */
