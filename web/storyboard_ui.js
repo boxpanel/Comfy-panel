@@ -13,7 +13,7 @@ import {
   parseFrameName,
   parseVoiceDialoguePack,
   summarize,
-} from "./storyboard_parser.js?v=20261124e";
+} from "./storyboard_parser.js?v=20261124g";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -77,7 +77,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.57 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.59 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -758,7 +758,7 @@ export function createStoryboardPanel(root, app) {
         <div><b>A 档 · 静</b>：空教室、道具、静物这类没有人大幅动的镜头。</div>
         <div><b>B 档 · 人像（默认）</b>：单人或两人说话、近景中景，手册里的默认档。</div>
         <div><b>C 档 · 动</b>：多人、翻倒、挣扎、跑动，动作多、步数多一点。</div>
-        <div><b>步数</b>：20 是画质和速度的平衡点；24 给动作多的镜头。</div>
+        <div><b>步数</b>：16 是画质和速度的平衡点；24 给动作多的镜头。</div>
         <div><b>CFG</b>：4.5 表示“听话程度”，一般不用动。</div>
         <div><b>shift</b>：画面硬不硬，静 5、人像 6、动作 7。</div>
         <div><b>降噪</b>：图生视频必须 1.0，低了等于没动。</div>
@@ -2384,32 +2384,65 @@ export function createStoryboardPanel(root, app) {
         subfolder: shot.subfolder || "",
         type: shot.type || "output",
       });
-      const url = typeof api.apiURL === "function" ? api.apiURL(`/view?${query.toString()}`) : `/view?${query}`;
-      const response = await fetch(url, { method: "HEAD", cache: "no-store" });
+      const route = `/view?${query.toString()}`;
+      // 必须走 api.fetchApi：裸 fetch 不带登录凭据，pod 网关会回「需要授权」
+      const response =
+        typeof api.fetchApi === "function"
+          ? await api.fetchApi(route, { method: "HEAD", cache: "no-store" })
+          : await fetch(typeof api.apiURL === "function" ? api.apiURL(route) : route, {
+              method: "HEAD",
+              cache: "no-store",
+            });
       return response.ok;
     } catch (error) {
       return false;
     }
   }
 
-  /** 输出视频的 /view 地址（看视频用） */
-  function shotViewUrl(shot) {
+  /**
+   * 用面板的 API 通道把视频取成 blob 地址：播放和下载都走这里。
+   * 直接把 /view 地址塞进 <video src> 或新标签，浏览器不会带登录凭据，
+   * pod 网关会回「需要授权」；api.fetchApi 才带。
+   */
+  async function shotVideoBlobUrl(shot) {
+    if (!shot || !shot.filename) return "";
     const query = new URLSearchParams({
       filename: shot.filename,
       subfolder: shot.subfolder || "",
       type: shot.type || "output",
     });
-    return typeof api.apiURL === "function" ? api.apiURL(`/view?${query.toString()}`) : `/view?${query}`;
+    try {
+      const response = await api.fetchApi(`/view?${query.toString()}`, { cache: "no-store" });
+      if (!response.ok) return "";
+      return URL.createObjectURL(await response.blob());
+    } catch (error) {
+      return "";
+    }
+  }
+
+  /** 触发浏览器把 blob 存成本地文件 */
+  function triggerDownload(url, filename) {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
   }
 
   let playerWrap = null;
+  let playerBlobUrl = "";
   function closePlayer() {
     if (playerWrap && playerWrap.parentNode) playerWrap.parentNode.removeChild(playerWrap);
     playerWrap = null;
+    if (playerBlobUrl) {
+      URL.revokeObjectURL(playerBlobUrl);
+      playerBlobUrl = "";
+    }
   }
 
   /** 面板内看这一镜的视频，看完直接标合格 / 不合格 */
-  function openShotPlayer(unitId) {
+  async function openShotPlayer(unitId) {
     const shot = state.videos[unitId];
     if (!shot || !shot.filename) {
       toast("这一镜还没有生成视频", "err");
@@ -2425,14 +2458,15 @@ export function createStoryboardPanel(root, app) {
           <span class="sb-hint">${escapeHtml(shot.filename)}</span>
           <button class="sb-btn dim" data-player="close">×</button>
         </div>
-        <div class="sb-player"><video controls autoplay playsinline src="${escapeHtml(shotViewUrl(shot))}"></video></div>
+        <div class="sb-player"><video controls autoplay playsinline data-player="video"></video></div>
         <div class="sb-modal-foot">
-          <span class="sb-hint grow">有问题就标不合格，提醒自己这一镜要重做（标记不影响自动模式）</span>
+          <span class="sb-hint grow" data-player="hint">正在读取视频…</span>
+          <button class="sb-btn" data-player="download">下载</button>
           <button class="sb-btn ok" data-player="pass">合格</button>
           <button class="sb-btn bad" data-player="fail">不合格</button>
         </div>
       </div>`;
-    wrap.addEventListener("click", (event) => {
+    wrap.addEventListener("click", async (event) => {
       if (event.target === wrap) {
         closePlayer();
         return;
@@ -2444,11 +2478,38 @@ export function createStoryboardPanel(root, app) {
         closePlayer();
         return;
       }
+      if (action === "download") {
+        const filename = shot.filename || `${unitId}.mp4`;
+        const url = playerBlobUrl || (await shotVideoBlobUrl(shot));
+        if (!url) {
+          toast("下载失败：视频读不到，登录可能已过期，刷新页面重新登录后再试", "err");
+          return;
+        }
+        triggerDownload(url, filename);
+        if (url !== playerBlobUrl) setTimeout(() => URL.revokeObjectURL(url), 60000);
+        return;
+      }
       setVerdict(unitId, action === "pass" ? "pass" : "fail");
       closePlayer();
     });
     root.appendChild(wrap);
     playerWrap = wrap;
+
+    const video = wrap.querySelector('[data-player="video"]');
+    const hint = wrap.querySelector('[data-player="hint"]');
+    const url = await shotVideoBlobUrl(shot);
+    if (playerWrap !== wrap) {
+      if (url) URL.revokeObjectURL(url);
+      return;
+    }
+    if (!url) {
+      if (hint) hint.textContent = "视频读不到：登录可能已过期，刷新页面重新登录后再试";
+      toast("视频读不到：登录可能已过期", "err");
+      return;
+    }
+    playerBlobUrl = url;
+    video.src = url;
+    if (hint) hint.textContent = "有问题就标不合格，提醒自己这一镜要重做（标记不影响自动模式）";
   }
 
   /** 记下这一镜的验收结论；只作人工标记，不参与自动调度 */
