@@ -77,7 +77,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.59 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.60 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -204,6 +204,7 @@ const CSS = `
 .sb-frame select[data-el="draft-select"]{flex:0 0 auto;width:64px;}
 .sb-frame .sb-btn{padding:2px 7px;font-size:10px;}
 .sb-ov{width:100%;border-collapse:collapse;font-size:10px;}
+.sb-ov-bar{display:flex;align-items:center;gap:6px;margin-bottom:6px;}
 .sb-ov th,.sb-ov td{border-bottom:1px solid var(--sb-line);padding:2px 3px;text-align:left;white-space:nowrap;}
 .sb-ov th{color:var(--sb-muted);font-weight:500;}
 .sb-ov td.done{color:#3fb950;}
@@ -1380,7 +1381,12 @@ export function createStoryboardPanel(root, app) {
         </tr>`;
       })
       .join("");
-    el.overview.innerHTML = `<table class="sb-ov">${head}${rows}</table>`;
+    const videoCount = state.doc.units.filter((unit) => state.videos[unit.id]).length;
+    const bar = `<div class="sb-ov-bar">
+      <button class="sb-btn" data-ov="downloadall" ${videoCount ? "" : "disabled"} title="把清单里已生成的成片打成一个 zip 下载">⬇ 打包下载成片</button>
+      <span class="sb-hint">${videoCount ? `已生成 ${videoCount} 个成片` : "还没有已生成的成片"}</span>
+    </div>`;
+    el.overview.innerHTML = `${bar}<table class="sb-ov">${head}${rows}</table>`;
   }
 
   function renderProgress() {
@@ -2428,6 +2434,54 @@ export function createStoryboardPanel(root, app) {
     document.body.appendChild(link);
     link.click();
     link.remove();
+  }
+
+  /**
+   * 批量下载：清单里所有已生成的成片打成一个 zip。
+   * 由后端自己读 output 目录，前端不用逐个请求 /view（那些请求在 pod 上会被网关拦）。
+   */
+  async function downloadAllVideos() {
+    const units = state.doc ? state.doc.units : [];
+    const items = units
+      .map((unit) => {
+        const shot = state.videos[unit.id];
+        if (!shot || !shot.filename) return null;
+        return {
+          label: unit.id,
+          filename: shot.filename,
+          subfolder: shot.subfolder || "",
+          type: shot.type || "output",
+        };
+      })
+      .filter(Boolean);
+    if (!items.length) {
+      toast("清单里还没有已生成的成片", "err");
+      return;
+    }
+    toast(`正在打包 ${items.length} 个视频…`, "ok");
+    try {
+      const response = await api.fetchApi("/storyboard/batch-download", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items }),
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+        toast(`打包失败：${(data && data.message) || `HTTP ${response.status}`}`, "err");
+        return;
+      }
+      const missing = Number(response.headers.get("X-Storyboard-Missing") || 0);
+      const added = Number(response.headers.get("X-Storyboard-Added") || 0) || items.length - missing;
+      const url = URL.createObjectURL(await response.blob());
+      triggerDownload(url, `分镜成片_${added}条.zip`);
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      toast(
+        `已打包 ${added} 个视频${missing ? `；${missing} 个文件不在服务器上，已跳过` : ""}`,
+        missing ? "warn" : "ok"
+      );
+    } catch (error) {
+      toast(`打包失败：${error && error.message ? error.message : error}`, "err");
+    }
   }
 
   let playerWrap = null;
@@ -5238,6 +5292,10 @@ export function createStoryboardPanel(root, app) {
     el.overview.addEventListener("click", (event) => {
       const target = event.target.closest("[data-ov]");
       if (!target) return;
+      if (target.dataset.ov === "downloadall") {
+        downloadAllVideos();
+        return;
+      }
       const unitId = target.dataset.id;
       if (!unitId) return;
       if (target.dataset.ov === "watch") {

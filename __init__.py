@@ -20,7 +20,9 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 import urllib.request
+import zipfile
 from pathlib import Path
 
 import folder_paths
@@ -30,7 +32,7 @@ from server import PromptServer
 WEB_DIRECTORY = "./web"
 
 # 版本号：与 pyproject.toml 的 [project] version 保持一致，发版时一起改
-__version__ = "0.53.59"
+__version__ = "0.53.60"
 
 PLUGIN_DIR = Path(__file__).parent
 
@@ -430,6 +432,73 @@ async def storyboard_ref_video(request):
     except Exception as error:  # noqa: BLE001
         return web.json_response({"ok": False, "message": f"转存视频失败：{error}"})
     return web.json_response({"ok": True, "name": target.name, "source": source.name})
+
+
+@PromptServer.instance.routes.post("/storyboard/batch-download")
+async def storyboard_batch_download(request):
+    """把面板清单里已生成的成片打成一个 zip 返回。
+
+    视频在 output 目录里，浏览器直连 /view 不带登录态（pod 网关会回「需要授权」），
+    所以由后端自己读文件、打包，前端只下一个 zip。
+    """
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001 - 请求体异常按缺参处理
+        data = {}
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list) or not items:
+        return web.json_response({"ok": False, "message": "没有要打包的视频"}, status=400)
+
+    def build():
+        target = Path(folder_paths.get_temp_directory()) / f"storyboard_batch_{time.strftime('%Y%m%d_%H%M%S')}.zip"
+        added = 0
+        missing = 0
+        used = set()
+        # 视频本身已是压缩格式，ZIP_STORED 只做封装，不浪费时间再压一遍
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_STORED) as bundle:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                filename = str(item.get("filename") or "").strip()
+                if not filename:
+                    continue
+                subfolder = str(item.get("subfolder") or "").strip()
+                kind = str(item.get("type") or "output").strip()
+                root = _folder_root(kind)
+                folder = _inside(root, subfolder) if subfolder else root.resolve()
+                source = _find_storyboard_video(folder, filename) if folder is not None else None
+                if source is None:
+                    missing += 1
+                    continue
+                label = str(item.get("label") or "").strip()
+                name = f"{label}_{source.name}" if label else source.name
+                stem, suffix = os.path.splitext(name)
+                index = 2
+                while name in used:
+                    name = f"{stem}_{index}{suffix}"
+                    index += 1
+                used.add(name)
+                bundle.write(source, name)
+                added += 1
+        return target, added, missing
+
+    try:
+        target, added, missing = await asyncio.to_thread(build)
+    except Exception as error:  # noqa: BLE001
+        return web.json_response({"ok": False, "message": f"打包失败：{error}"}, status=500)
+    if not added:
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        return web.json_response({"ok": False, "message": "这些视频都不在服务器上了"}, status=404)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{target.name}"',
+        "Cache-Control": "no-store",
+        "X-Storyboard-Added": str(added),
+        "X-Storyboard-Missing": str(missing),
+    }
+    return web.FileResponse(target, headers=headers)
 
 
 def _install_no_cache_middleware():
