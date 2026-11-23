@@ -11,10 +11,9 @@ import {
   parseAnyStoryboard,
   parseAssetNames,
   parseFrameName,
-  parseStoryboard,
   parseVoiceDialoguePack,
   summarize,
-} from "./storyboard_parser.js?v=20261124";
+} from "./storyboard_parser.js?v=20261124b";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -78,7 +77,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.53 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.54 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -486,6 +485,8 @@ function loadState() {
     verdict: saved.verdict && typeof saved.verdict === "object" ? saved.verdict : {},
     // 面板日志：做过什么、哪里报错（刷新页面后还留着）
     log: Array.isArray(saved.log) ? saved.log.slice(-200) : [],
+    // 从 09 分镜表按镜号补出来的素材编号（刷新后 raw 重新解析会丢，这里补回去）
+    assetExtra: saved.assetExtra && typeof saved.assetExtra === "object" ? saved.assetExtra : {},
     draftBase:
       saved.draftBase &&
       typeof saved.draftBase === "object" &&
@@ -582,7 +583,24 @@ export function createStoryboardPanel(root, app) {
 
   const state = loadState();
   if (state.raw) {
-    state.doc = parseStoryboard(state.raw);
+    // raw 可能是 JSON / CSV / txt / 六段式，统一走内容识别；刷新后素材补丁再叠回去
+    state.doc = parseAnyStoryboard(state.raw);
+    applyStoredUnitAssets();
+  }
+
+  /** 把持久化的「按镜号补出来的素材编号」叠回单元 */
+  function applyStoredUnitAssets() {
+    if (!state.doc || !state.assetExtra) return;
+    state.doc.units.forEach((unit) => {
+      const extra = state.assetExtra[unit.id];
+      if (!Array.isArray(extra) || !extra.length) return;
+      const have = new Set(unit.assets || []);
+      extra.forEach((code) => {
+        if (!code || have.has(code)) return;
+        have.add(code);
+        (unit.assets || (unit.assets = [])).push(code);
+      });
+    });
   }
 
   let searchTimer = null;
@@ -858,6 +876,7 @@ export function createStoryboardPanel(root, app) {
           fight: state.fight,
           verdict: state.verdict,
           log: state.log.slice(-200),
+          assetExtra: state.assetExtra,
           draftBase: state.draftBase,
           quality: state.quality,
           selected: state.selected,
@@ -4266,6 +4285,8 @@ export function createStoryboardPanel(root, app) {
       logLine("已采用提示词包的全局负向提示词", "ok");
     }
     state.applied = {};
+    // 换了一份文档，上一份按镜号补的素材编号作废
+    state.assetExtra = {};
     // 新文档导入后总清单全部重新勾选
     state.selected = {};
     const docIds = new Set(state.doc.units.map((unit) => unit.id));
@@ -4554,17 +4575,26 @@ export function createStoryboardPanel(root, app) {
     });
     if (!byShot.size) return 0;
     let added = 0;
+    const extra = {};
     units.forEach((unit) => {
       const have = new Set(unit.assets || []);
+      const fresh = [];
       unitShotNumbers(unit).forEach((no) => {
         (byShot.get(no) || []).forEach((code) => {
           if (have.has(code)) return;
           have.add(code);
           (unit.assets || (unit.assets = [])).push(code);
+          fresh.push(code);
           added += 1;
         });
       });
+      if (fresh.length) extra[unit.id] = fresh;
     });
+    // 记下来：刷新页面后 raw 重新解析会丢掉这些编号，靠它叠回去
+    if (Object.keys(extra).length) {
+      state.assetExtra = { ...(state.assetExtra || {}), ...extra };
+      persist();
+    }
     return added;
   }
 
