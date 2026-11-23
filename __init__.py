@@ -30,7 +30,7 @@ from server import PromptServer
 WEB_DIRECTORY = "./web"
 
 # 版本号：与 pyproject.toml 的 [project] version 保持一致，发版时一起改
-__version__ = "0.53.52"
+__version__ = "0.53.53"
 
 PLUGIN_DIR = Path(__file__).parent
 
@@ -240,9 +240,16 @@ def _update_status():
         head = _git(["rev-parse", "--short", "HEAD"]).stdout.strip()
         counts = _git(["rev-list", "--left-right", "--count", "HEAD...@{u}"]).stdout.split()
         ahead, behind = (int(counts[0]), int(counts[1])) if len(counts) == 2 else (0, 0)
-        # 只有「被改过的已跟踪文件」才阻止更新；残留的旧 js、__pycache__ 不算
+        # 只有「已跟踪文件被改 / 被删」才阻止更新；新增文件（A）、残留旧 js、__pycache__ 都不算，
+        # 否则给仓库加个 .gitattributes 之类的新文件就永远更新不了
         dirty_out = _git(["status", "--porcelain", "--untracked-files=no"]).stdout.strip()
-        dirty_files = [line[3:].strip() for line in dirty_out.splitlines() if line.strip()]
+        dirty_files = []
+        for line in dirty_out.splitlines():
+            if not line.strip() or len(line) < 4:
+                continue
+            code = line[:2]
+            if "M" in code or "D" in code or "R" in code:
+                dirty_files.append(line[3:].strip())
         untracked_out = _git(["status", "--porcelain", "--untracked-files=normal"]).stdout
         untracked = [
             line[3:].strip()
@@ -298,19 +305,24 @@ def _update_apply():
     status = _update_status()
     if not status.get("ok"):
         return {"ok": False, "message": status.get("message", "无法检查更新")}
+    # 先看有没有新提交：已经是最新就直接回「已是最新」，不再被本地改动拦住
+    if not status.get("behind"):
+        removed = _drop_stale_web_js()
+        note = ""
+        if status.get("dirty"):
+            files = "、".join(status.get("dirtyFiles", [])[:5]) or "工作区文件"
+            note = f"；本地有改动（{files}），不影响当前版本"
+        return {
+            "ok": True,
+            "changed": [],
+            "removed": removed,
+            "message": f"已是最新版本（{status.get('head')}）" + (f"，已清理旧入口 {len(removed)} 个" if removed else "") + note,
+        }
     if status.get("dirty"):
         files = "、".join(status.get("dirtyFiles", [])[:5]) or "工作区文件"
         return {
             "ok": False,
             "message": f"这些文件被改过：{files}。在插件目录执行 git checkout -- . 后再更新",
-        }
-    if not status.get("behind"):
-        removed = _drop_stale_web_js()
-        return {
-            "ok": True,
-            "changed": [],
-            "removed": removed,
-            "message": f"已是最新版本（{status.get('head')}）" + (f"，已清理旧入口 {len(removed)} 个" if removed else ""),
         }
     before = _git(["rev-parse", "HEAD"]).stdout.strip()
     pull = _git(["pull", "--ff-only"])

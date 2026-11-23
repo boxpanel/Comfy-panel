@@ -762,6 +762,8 @@ function parseStructuredPromptPack(text) {
       if (first) nominal = Number(first[1]);
     }
 
+    // 素材绑定行可能是「—（待素材表生成后回填）」；这时从 subject_definitions 里抽编号兜底，
+    // 否则这些单元一个素材都挂不上，面板「本批素材」会是 0
     const pictures = bind ? parsePictureBindings(bind[1]) : [];
     const subjects = parseSubjectDefinitions(sections.subject_definitions);
     pictures.forEach((pic) => {
@@ -770,6 +772,10 @@ function parseStructuredPromptPack(text) {
       const label = /[\u4e00-\u9fff]/.test(subject.name) ? subject.name : subject.enName || subject.name;
       if (label) assetNames[pic.code] = label;
     });
+    const boundCodes = pictures.map((item) => item.code);
+    const assetCodes = boundCodes.length
+      ? boundCodes
+      : extractAssets(`${sections.subject_definitions || ""}\n${sections.summary || ""}`);
     const audioDefs = parseAudioDefinitions(sections.subject_definitions);
     const audioRetention = parseAudioRetention(sections.retention_analysis);
     const voiceBindings = voice ? voice[1].trim() : "";
@@ -823,7 +829,7 @@ function parseStructuredPromptPack(text) {
       alignedSeconds: meta ? Number(meta[5]) : 0,
       shot: "",
       camera: "",
-      assets: pictures.map((item) => item.code),
+      assets: assetCodes,
       audioRefs,
       voiceBindings,
       subjects,

@@ -14,7 +14,7 @@ import {
   parseStoryboard,
   parseVoiceDialoguePack,
   summarize,
-} from "./storyboard_parser.js?v=20261122";
+} from "./storyboard_parser.js?v=20261124";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -78,7 +78,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.52 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.53 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -4541,6 +4541,33 @@ export function createStoryboardPanel(root, app) {
     return added;
   }
 
+  /** 12 单元稿常写「素材绑定：—（待素材表生成后回填）」，这里按镜号从 09 JSON 的 assetRefs 补齐 */
+  function mergeShotAssets(units, shots) {
+    if (!Array.isArray(shots) || !shots.length) return 0;
+    const byShot = new Map();
+    shots.forEach((shot) => {
+      const no = Number(shot && shot.shot);
+      const refs = (Array.isArray(shot && shot.assetRefs) ? shot.assetRefs : [])
+        .map((code) => String(code || "").trim())
+        .filter(Boolean);
+      if (no && refs.length) byShot.set(no, refs);
+    });
+    if (!byShot.size) return 0;
+    let added = 0;
+    units.forEach((unit) => {
+      const have = new Set(unit.assets || []);
+      unitShotNumbers(unit).forEach((no) => {
+        (byShot.get(no) || []).forEach((code) => {
+          if (have.has(code)) return;
+          have.add(code);
+          (unit.assets || (unit.assets = [])).push(code);
+          added += 1;
+        });
+      });
+    });
+    return added;
+  }
+
   /** 多选导入：以 09 JSON 为主源，其余文件只做镜数核对 / 素材名称补全 / 台词并入 */
   async function importFiles(fileList) {
     const raw = Array.from(fileList || []);
@@ -4665,6 +4692,20 @@ export function createStoryboardPanel(root, app) {
           renderList();
           logLine(`已从 04 声音与对白表并入 ${added} 句台词`, "ok");
         }
+      }
+    }
+    // 12 单元稿的「素材绑定」常是「待回填」：按镜号从 09 JSON 的 assetRefs 补素材编号
+    const jsonEntry = entries.find((entry) => entry.kind === "json");
+    if (jsonEntry && state.doc && state.doc.units.some((unit) => !(unit.assets || []).length)) {
+      try {
+        const data = JSON.parse(jsonEntry.text);
+        const added = mergeShotAssets(state.doc.units, Array.isArray(data.shots) ? data.shots : []);
+        if (added) {
+          renderList();
+          logLine(`已从 09 分镜表按镜号补 ${added} 条素材编号`, "ok");
+        }
+      } catch (error) {
+        /* JSON 不合法就当没有 */
       }
     }
     if (entries.some((entry) => entry.kind === "frames")) {
