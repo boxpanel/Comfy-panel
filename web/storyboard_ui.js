@@ -13,7 +13,7 @@ import {
   parseFrameName,
   parseVoiceDialoguePack,
   summarize,
-} from "./storyboard_parser.js?v=20261124d";
+} from "./storyboard_parser.js?v=20261124e";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -77,7 +77,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.56 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.57 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -1022,14 +1022,19 @@ export function createStoryboardPanel(root, app) {
     const shelf = (state.doc && state.doc.assets) || [];
     const item = shelf.find((entry) => entry.id === canonicalCode(code));
     if (item && item.kind) return item.kind;
-    // 旧手册没有类型字段，按旧编号习惯猜
+    // 没有类型字段时按编号前缀判断（新包约定：S 角色 / C 服装 / P 道具 / E 场景 / A 关系 / V 声音）
     if (/^ST-/.test(code)) return "风格";
+    if (/^T-P/i.test(code) || /^P-/.test(code)) return "道具";
+    if (/^C-/.test(code)) return "服装";
+    if (/^E-/.test(code)) return "场景";
+    if (/^A-/.test(code)) return "关系";
+    if (/^(V|RA)-/i.test(code)) return "声音";
+    if (/^S-/.test(code)) return "角色";
+    // 旧手册沿用：R 人物 / G 群像
     if (/^R-/.test(code)) return "人物";
     if (/^G-/.test(code)) return "群像";
-    if (/^P-/.test(code) || /^T-P/.test(code)) return "道具";
-    if (/^C-/.test(code)) return "参考";
-    if (/^S-/.test(code)) return "场景";
-    return "人物";
+    if (/^T-/.test(code)) return "道具";
+    return "素材";
   }
 
   function renderAssets() {
@@ -4756,6 +4761,8 @@ export function createStoryboardPanel(root, app) {
       } catch (error) {
         /* JSON 不合法就当没有 */
       }
+    } else if (!jsonEntry && state.doc && state.doc.units.some((unit) => unit.structuredPrompt)) {
+      logLine("这次没选 09-分镜表.json：素材编号只能从 12 正文里抽，可能不全；建议整包多选导入", "warn");
     }
     if (entries.some((entry) => entry.kind === "frames")) {
       logLine("02 首尾帧表暂不单独导入（首尾帧已随 09 / 12 进卡）", "info");
