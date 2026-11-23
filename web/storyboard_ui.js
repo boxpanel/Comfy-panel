@@ -13,7 +13,7 @@ import {
   parseFrameName,
   parseVoiceDialoguePack,
   summarize,
-} from "./storyboard_parser.js?v=20261124c";
+} from "./storyboard_parser.js?v=20261124d";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -77,7 +77,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.55 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.56 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -2248,6 +2248,15 @@ export function createStoryboardPanel(root, app) {
     // 只保留写上了素材的窗口：规则桥上 Picture (picks.length+1) 起的入口全部断开
     const clearResult = await clearPictureSlotsFrom(app, picks.length);
     let cleared = clearResult.cleared;
+    // 用几个开几个：picks.length 之后的位置不管直连还是过桥，一律断开并停用加载窗口
+    for (const slot of referenceImageSlots(app)) {
+      if (slot.index < picks.length) continue;
+      try {
+        if (clearReferenceSlot(app, slot)) cleared += 1;
+      } catch (error) {
+        /* 单路失败不影响其它路 */
+      }
+    }
     // 需要却没写对的位也断开，避免串用上一镜的图
     for (const slot of referenceImageSlots(app)) {
       if (slot.index >= picks.length) continue;
@@ -2266,7 +2275,7 @@ export function createStoryboardPanel(root, app) {
     if (kept) parts.push(`沿用 ${kept} 张`);
     const written = filled - kept;
     if (written) parts.push(`写入 ${written} 张`);
-    if (cleared) parts.push(`已清空 ${cleared} 个无素材参考位`);
+    if (cleared) parts.push(`关闭 ${cleared} 个用不到的参考位`);
     if (clearResult.left) parts.push(`还有 ${clearResult.left} 根多余连线没断开`);
     if (idle) parts.push(`清空 ${idle} 个未使用的加载窗口`);
     if (failed.length) parts.push(`失败 ${failed.length} 张：${failed.slice(0, 3).join("、")}`);
@@ -2305,7 +2314,7 @@ export function createStoryboardPanel(root, app) {
     }
     const cleared = clearAudioSlotsFrom(app, limit);
     if (written) parts.push(`参考音频 ${written} 个已接上`);
-    if (cleared) parts.push(`断开 ${cleared} 个旧音频`);
+    if (cleared) parts.push(`关闭 ${cleared} 个用不到的音频位`);
     if (failed.length) parts.push(`音频失败：${failed.slice(0, 2).join("、")}`);
     if (offline) parts.push("音频文件不在当前会话，重新点一次「素材库」选文件夹即可");
     if (picks.length > slots.length) parts.push(`参考音频位只有 ${slots.length} 个`);
