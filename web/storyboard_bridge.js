@@ -5,7 +5,7 @@
 const TEXT_WIDGETS = ["text", "prompt", "string"];
 
 /** 桥接模块构建号：面板徽标里一起显示，用来确认浏览器加载的是新代码 */
-export const BRIDGE_BUILD = "20261124a";
+export const BRIDGE_BUILD = "20261124b";
 
 /** 只返回真正参与执行的工作流节点（排除静音 mode 2 与旁路 mode 4） */
 export function getNodes(app) {
@@ -458,8 +458,8 @@ export function clearFrameImage(app, kind) {
 
 export const H3_FPS = 24;
 
-// 成片像素档：分镜手册只用来定画面比例，像素统一按 1.0MP（约 1344×752）跑
-const H3_MEGAPIXELS = 1.0;
+// 成片像素档：分镜手册只用来定画面比例，像素统一按 1.5MP（1664×928）跑
+const H3_MEGAPIXELS = 1.5;
 
 /** H3 的帧率固定 24；把被误写成 16/其他值的 H3 节点修正回来，返回修正过的节点号 */
 export function ensureH3Fps(app) {
