@@ -619,9 +619,10 @@ export function resolveAudioRefs(units, nameMap) {
   (units || []).forEach((unit) => {
     (unit.audioRefs || []).forEach((ref) => {
       if (!ref || ref.code) return;
+      // 分段投喂包每段都从 (S1) 重新编号，说话人号不能跨段对；先按名字认，名字缺失再退回说话人号
       const code =
-        (ref.speaker && bySpeaker.get(String(ref.speaker).toUpperCase())) ||
         byName.get(normalizeAssetName(ref.name)) ||
+        (ref.speaker && bySpeaker.get(String(ref.speaker).toUpperCase())) ||
         "";
       if (!code) return;
       ref.code = code;
@@ -831,25 +832,105 @@ function parseShotNumbers(tail) {
   return [...new Set(found)].sort((a, b) => a - b);
 }
 
+/** H3 合法帧长 5+17n：交付帧数是名义值，向上取最近的合法值（分段投喂契约第 8 节） */
+function h3FramesUp(frames) {
+  const value = Math.round(Number(frames) || 0);
+  if (!Number.isFinite(value) || value < 5) return 0;
+  return 5 + 17 * Math.max(1, Math.ceil((value - 5) / 17));
+}
+
+/** 13-分段投喂_段清单.md → 对账行（段 / 镜头 / 镜数 / 时长 / 帧数 / 说话人 / 台词 / 素材 / 衔接） */
+export function parseSegmentManifest(text) {
+  const rows = [];
+  String(text || "")
+    .split(/\r?\n/)
+    .forEach((line) => {
+      const cells = line.split("|").map((cell) => cell.trim());
+      if (cells.length < 11) return;
+      const seg = cells[1] && cells[1].match(/^(\d{2})$/);
+      const range = cells[2] && cells[2].match(/^(\d{1,3})\s*[—–-]\s*(\d{1,3})$/);
+      if (!seg || !range) return;
+      rows.push({
+        seg: seg[1],
+        from: Number(range[1]),
+        to: Number(range[2]),
+        shots: Number(cells[3]) || 0,
+        seconds: Number(String(cells[4]).replace(/[^\d.]/g, "")) || 0,
+        frames: Number(cells[5]) || 0,
+        speakers: cells[6] || "",
+        lines: Number(cells[7]) || 0,
+        assets: Number(cells[8]) || 0,
+        joint: cells[9] || "",
+      });
+    });
+  return rows;
+}
+
+/** 分段投喂契约自检（第 10 节）：段头镜数、[Shot N]、说话人上限、图位越界、切点时间码 */
+function validateSegmentUnits(units, warnings) {
+  (units || []).forEach((unit) => {
+    if (!unit.segment) return;
+    const body = String((unit.sections && unit.sections.detailed_description) || "");
+    const shots = (body.match(/^\[Shot \d+\]/gm) || []).length;
+    if (unit.shotCount && shots !== unit.shotCount) {
+      warnings.push(`${unit.id} 段头写 ${unit.shotCount} 镜，正文有 ${shots} 个 [Shot N]`);
+    }
+    const speakers = new Set((body.match(/\((S\d+)\)/g) || []).map((item) => item.slice(1, -1)));
+    if (speakers.size > 2) warnings.push(`${unit.id} 有 ${speakers.size} 个说话人（上限 2）`);
+    if (Number(unit.duration) > 15.01) warnings.push(`${unit.id} 时长 ${unit.duration} 秒，超过单段 15 秒`);
+    const limit = (unit.assetBindings || []).length;
+    if (limit) {
+      const over = new Set();
+      String(`${body} ${(unit.sections && unit.sections.subject_definitions) || ""}`).replace(
+        /<Picture\s+(\d+)>/g,
+        (_, no) => {
+          if (Number(no) > limit) over.add(Number(no));
+          return "";
+        }
+      );
+      if (over.size) {
+        warnings.push(`${unit.id} 用到 <Picture ${[...over].join(">、<Picture ")}>，但只绑了 ${limit} 张`);
+      }
+    }
+    // 切点是段内相对时间，必须严格递增且都落在段尾之前
+    const cuts = [];
+    body.replace(/At (\d{2}):(\d{2})\.(\d{3})/g, (_, m, s, ms) => {
+      cuts.push(Number(m) * 60 + Number(s) + Number(ms) / 1000);
+      return "";
+    });
+    if (cuts.some((value, index) => index > 0 && value <= cuts[index - 1])) {
+      warnings.push(`${unit.id} 切点时间码没有递增`);
+    }
+    if (unit.duration && cuts.some((value) => value >= Number(unit.duration))) {
+      warnings.push(`${unit.id} 切点时间码超过段尾 ${unit.duration} 秒`);
+    }
+  });
+}
+
 /** 结构化成片提示词（单元包 / 样张）→ 与旧手册相同的 doc 结构 */
 function parseStructuredPromptPack(text) {
   const unitHeads = [];
   let match;
-  // 单元标题有三种出包写法：旧包 `## U001 · 镜头 01—04`、样例新包 `### U001 · 镜头 01—01`、
-  // 正式 zip 包 `## 镜 001 · 镜头 01—06`；新包还会带后缀与多段区间：
-  //   `## 镜 001 · 镜头 01—03、05—06（共 5 镜，镜 04 拆为单独一条）`
-  //   `## 镜 004 · 镜头 04`
-  const unitRe = /^#{2,4}\s+(?:U(\d{3})|镜\s*(\d{3}))\s*[·・]\s*镜头\s*([^\n]+?)\s*$/gm;
+  // 单元标题有四种出包写法：旧包 `## U001 · 镜头 01—04`、样例新包 `### U001 · 镜头 01—01`、
+  // 正式 zip 包 `## 镜 001 · 镜头 01—06`、分段投喂包 `## 段 01 · 镜头 01—02（共 2 镜，13.0 秒，312 帧）`；
+  // 还会带后缀与多段区间：`## 镜 001 · 镜头 01—03、05—06（共 5 镜，镜 04 拆为单独一条）`
+  const unitRe = /^#{2,4}\s+(?:U(\d{3})|镜\s*(\d{3})|段\s*(\d{1,3}))\s*[·・]\s*镜头\s*([^\n]+?)\s*$/gm;
   while ((match = unitRe.exec(text))) {
-    const shots = parseShotNumbers(match[3]);
+    const shots = parseShotNumbers(match[4]);
     if (!shots.length) continue;
+    // 段标题括号里直接给了「共 2 镜，13.0 秒，312 帧」
+    const inner = (match[4].match(/[（(]([^）)]*)[）)]/) || [])[1] || "";
     unitHeads.push({
       index: match.index,
       end: match.index + match[0].length,
-      uid: `U${match[1] || match[2]}`,
+      uid: match[1] ? `U${match[1]}` : match[2] ? `U${match[2]}` : `D${String(match[3]).padStart(2, "0")}`,
+      seg: match[3] || "",
       from: shots[0],
       to: shots[shots.length - 1],
       shots,
+      shotCount: Number((inner.match(/共\s*(\d+)\s*镜/) || [])[1]) || shots.length,
+      seconds: Number((inner.match(/(\d+(?:\.\d+)?)\s*秒/) || [])[1]) || 0,
+      frames: Number((inner.match(/(\d+)\s*帧/) || [])[1]) || 0,
     });
   }
   if (!unitHeads.length) {
@@ -876,6 +957,8 @@ function parseStructuredPromptPack(text) {
   const scene = { no: 1, name: title, note: "", units: [] };
   const units = [];
   const warnings = [];
+  // 分段投喂（13）走契约：段内编号各段独立、只有标注的段接上一段尾帧
+  const segmentContract = unitHeads.some((head) => !!head.seg);
   // 素材编号 → 名称：从 subject_definitions 反推（有中文用中文，没有就用英文名）
   const assetNames = {};
 
@@ -898,6 +981,8 @@ function parseStructuredPromptPack(text) {
     const voice = block.match(/^[-*]?\s*音色绑定[：:]\s*(.+)$/m);
 
     let nominal = meta ? Number(meta[3]) : 0;
+    // 分段投喂包把「13.0 秒」写在段标题括号里
+    if (!nominal && head.seconds) nominal = head.seconds;
     if (!nominal && head.tail) {
       const first = head.tail.match(/^(\d+(?:\.\d+)?)\s*(?:s|秒)/i);
       if (first) nominal = Number(first[1]);
@@ -948,12 +1033,20 @@ function parseStructuredPromptPack(text) {
 
     const id = head.uid;
     const label = head.heading ? head.heading.label : String(head.from).padStart(2, "0");
+    // 帧数：meta 行的「对齐 N 帧」优先，其次是段标题里的「312 帧」；
+    // 分段投喂的段头帧数是名义值，按契约向上贴到 H3 的 5+17n 合法帧长
+    const packFrames = meta ? Number(meta[4]) : head.frames || 0;
+    const frames = head.seg ? h3FramesUp(packFrames) : packFrames;
+    // 契约第 7 节：首镜写 `The shot continues without a cut:` 的段才接上一段尾帧
+    const shot1 = String(sections.detailed_description || "").match(/^\[Shot 1\][^\n]*/m);
+    const continuityFromPrev = !!(head.seg && shot1 && /^\[Shot 1\]\s*The shot continues without a cut/i.test(shot1[0]));
 
     const missing = PROMPT_SECTIONS.filter((key) => !sections[key]);
     if (missing.length) warnings.push(`${id} 六段式缺 ${missing.join("、")}`);
-    // 只查 summary / detailed_description 这两段「正文」；subject_definitions 里标注素材编号是正常写法
+    // 只查 summary / detailed_description 这两段「正文」；subject_definitions 里标注素材编号是正常写法。
+    // 分段投喂包按契约就是在正文里点名道具（Prop lock / P-01），这条检查只对 12 这类单元稿有意义
     const bodyForAssetCheck = [sections.summary, sections.detailed_description].filter(Boolean).join("\n");
-    if (new RegExp(`(?:^|[\\s(])${STRUCT_CODE_RE}`, "m").test(bodyForAssetCheck)) {
+    if (!head.seg && new RegExp(`(?:^|[\\s(])${STRUCT_CODE_RE}`, "m").test(bodyForAssetCheck)) {
       warnings.push(`${id} 正文出现素材编号，应只用 <Subject N>`);
     }
     const defined = new Set(subjects.map((item) => item.subject));
@@ -975,13 +1068,17 @@ function parseStructuredPromptPack(text) {
       shotTo: head.to,
       // 新包可能是 `01—03、05—06` 这种不连续区间，镜号列表以它为准
       shotNumbers: head.shots || null,
+      // 分段投喂：段号 / 段头声明的镜数 / 是否接上一段尾帧
+      segment: head.seg || "",
+      shotCount: head.seg ? head.shotCount : 0,
+      continuityFromPrev,
       // 素材绑定行的原始图位（名字可能没有编号，导入 09 后按名字补编号）
       assetBindings: pictures,
       sceneName: meta ? meta[1].trim() : title,
       durationText: nominal ? `${nominal} 秒` : "",
       duration: nominal,
-      // 交付稿已算好 17k+5 的帧数（向上对齐），计划工作流直接用这个值
-      frames: meta ? Number(meta[4]) : 0,
+      // 分段投喂的段头帧数是名义值，已按 5+17n 向上吸附
+      frames,
       alignedSeconds: meta ? Number(meta[5]) : 0,
       shot: "",
       camera: "",
@@ -1017,6 +1114,8 @@ function parseStructuredPromptPack(text) {
     scene.units.push(unit);
   });
 
+  if (segmentContract) validateSegmentUnits(units, warnings);
+
   return {
     title,
     scenes: [scene],
@@ -1030,6 +1129,7 @@ function parseStructuredPromptPack(text) {
     negativePrompt: "",
     source: "pack",
     structured: true,
+    segmentContract,
   };
 }
 

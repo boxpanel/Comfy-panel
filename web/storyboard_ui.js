@@ -11,11 +11,12 @@ import {
   parseAnyStoryboard,
   parseAssetNames,
   parseFrameName,
+  parseSegmentManifest,
   parseVoiceDialoguePack,
   resolveAudioRefs,
   resolveBindingAssets,
   summarize,
-} from "./storyboard_parser.js?v=20261124t";
+} from "./storyboard_parser.js?v=20261125a";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -80,7 +81,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.69 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.70 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -499,6 +500,9 @@ function loadState() {
     assetExtra: saved.assetExtra && typeof saved.assetExtra === "object" ? saved.assetExtra : {},
     // 03 / 09 读进来的「编号 → 名称」（不在 raw 里）：新版 12 只有素材名字，刷新后靠它补编号
     assetNames: saved.assetNames && typeof saved.assetNames === "object" ? saved.assetNames : {},
+    // 13 段清单判定的「尾帧续接」段（正文只有 17 / 25 写了 continue，20 / 30 靠清单），刷新后叠回
+    continuitySegments:
+      saved.continuitySegments && typeof saved.continuitySegments === "object" ? saved.continuitySegments : {},
     draftBase:
       saved.draftBase &&
       typeof saved.draftBase === "object" &&
@@ -601,6 +605,10 @@ export function createStoryboardPanel(root, app) {
     state.doc.assetNames = { ...(state.assetNames || {}), ...(state.doc.assetNames || {}) };
     resolveBindingAssets(state.doc.units, state.doc.assetNames);
     resolveAudioRefs(state.doc.units, state.doc.assetNames);
+    // 分段投喂：刷新后正文只认得出 17 / 25，20 / 30 的「尾帧续接」从本地存回来
+    state.doc.units.forEach((unit) => {
+      if (state.continuitySegments[unit.id]) unit.continuityFromPrev = true;
+    });
     applyStoredUnitAssets();
     // 载入诊断：整份分镜一个素材编号都没有时，把原因写进日志，免得只看到「本批素材 0 行」
     const units = state.doc.units || [];
@@ -908,6 +916,12 @@ export function createStoryboardPanel(root, app) {
           log: state.log.slice(-200),
           assetExtra: state.assetExtra,
           assetNames: (state.doc && state.doc.assetNames) || state.assetNames || {},
+          continuitySegments:
+            state.doc && state.doc.segmentContract
+              ? Object.fromEntries(
+                  state.doc.units.filter((unit) => unit.continuityFromPrev).map((unit) => [unit.id, true])
+                )
+              : {},
           draftBase: state.draftBase,
           quality: state.quality,
           selected: state.selected,
@@ -2693,6 +2707,11 @@ export function createStoryboardPanel(root, app) {
       const cleared = clearVideoSlotsFrom(app, 0);
       return { ok: true, message: cleared ? "硬切：已断开上一镜参考视频" : "硬切：不接上一镜" };
     }
+    // 分段投喂契约：只有标「尾帧续接」的段接上一段尾帧，其余段首帧图锚定、不沿用上一段画面
+    if (state.doc && state.doc.segmentContract && !unit.continuityFromPrev) {
+      const cleared = clearVideoSlotsFrom(app, 0);
+      return { ok: true, message: cleared ? "首帧图锚定：已断开上一段参考视频" : "首帧图锚定：不接上一段" };
+    }
     if (settings().continuityVideo === false) {
       const cleared = clearVideoSlotsFrom(app, 0);
       return { ok: true, message: cleared ? "已关闭跨镜接续，清空参考视频" : "" };
@@ -3407,7 +3426,7 @@ export function createStoryboardPanel(root, app) {
     const frames = Number(unit.frames) > 0 ? Number(unit.frames) : isH3 ? alignedFrames(seconds) : params.frames;
     const parts = [
       params.name,
-      `${duration}（生成 ${frames} 帧${isH3 ? " · 24fps" : ""}）`,
+      `${duration}（生成 ${frames} 帧${isH3 ? ` = ${(frames / 24).toFixed(1)} 秒 · 24fps` : ""}）`,
       `${params.width}×${params.height}`,
       `${params.steps} 步`,
       `CFG ${params.cfg}`,
@@ -4581,6 +4600,20 @@ export function createStoryboardPanel(root, app) {
       const warnings = Array.isArray(state.doc.warnings) ? state.doc.warnings : [];
       // 交付自检不是导入失败：黄色的 warn，别用红色 err 吓人
       warnings.forEach((warning) => logLine(warning, "warn"));
+      // H3 单次只生成 4—15 秒：单元超过 15 秒会链式往下跑，容易超时；分段投喂版按段切好了
+      const longUnits = state.doc.units.filter((unit) => Number(unit.duration) > 15.01);
+      if (longUnits.length) {
+        const list = longUnits
+          .slice(0, 3)
+          .map((unit) => `${unit.id} ${Number(unit.duration).toFixed(0)} 秒`)
+          .join("、");
+        logLine(
+          `有 ${longUnits.length} 个单元超过 H3 单次 15 秒上限（${list}${
+            longUnits.length > 3 ? "…" : ""
+          }）：会链式生成、容易超时；优先导入 13-分段投喂_结构化成片提示词.md，按段逐段生成`,
+          "warn"
+        );
+      }
       const warnTail = warnings.length ? `；${warnings[0]}` : "";
       toast(
         `已解析 ${stats.scenes} 场 / ${stats.total} 个单元${sourceName ? "：" + sourceName : ""}${tail}${warnTail}`,
@@ -4613,7 +4646,7 @@ export function createStoryboardPanel(root, app) {
   }
 
   // 提示词包里的三类镜表 + 几张附表，按内容认；文件名前缀作兜底（00~12 是出包端固定编号）
-  const PACK_KIND_LABEL = { units: "12 单元稿", json: "09 JSON", csv: "07 CSV", txt: "05 TXT", shots: "01 分镜", assets: "03 素材", frames: "02 首尾帧", voicedlg: "04 声音与对白" };
+  const PACK_KIND_LABEL = { segments: "13 分段投喂", units: "12 单元稿", json: "09 JSON", csv: "07 CSV", txt: "05 TXT", shots: "01 分镜", assets: "03 素材", frames: "02 首尾帧", voicedlg: "04 声音与对白", manifest: "13 段清单" };
   const PACK_FILE_KIND = {
     "00": "doc",
     "01": "shots",
@@ -4635,9 +4668,10 @@ export function createStoryboardPanel(root, app) {
     negative: "06 是负向提示词：请导入 09 或 12，负向会一并读入",
     doc: "00 是项目说明，不含分镜",
     discussion: "08 是讨论记录，不含分镜",
-    voicedlg: "04 是声音与对白表：请和 09 / 12 一起多选导入，台词会按镜号并进对应卡",
+    voicedlg: "04 是声音与对白表：请和 09 / 12 / 13 一起多选导入，台词会按镜号并进对应卡",
     voice: "这是音色清单：音色已写在单元提示词的「音色绑定」行，不用单独导入",
-    manifest: "这是单元切分清单：只用来核对镜数，不参与导入",
+    manifest: "13 段清单只用来核对段数 / 时长，不参与导入；请导入 13-分段投喂_结构化成片提示词.md",
+    contract: "13 解析契约是给解析端的说明书（里面有段头示例），不含成片分镜，不用导入",
   };
 
   // ---------- 压缩包 ----------
@@ -4749,6 +4783,9 @@ export function createStoryboardPanel(root, app) {
     const head = String(text || "").slice(0, 6000);
     // 先按正文认：出包端的编号含义会变（有的包里 04 是声音对白表，不是 04 镜表），
     // 只按前缀判会把附表当主源，整包解析出 0 镜
+    // 解析契约是写给解析端的说明书，里面有段头 / 字段名的示例，不能被当成正文
+    if (/分段投喂解析契约|解析契约/.test(head)) return "contract";
+    if (/^#{2,4}\s+段\s*\d{1,3}\s*[·・]\s*镜头/m.test(head) && /^subject_definitions:/m.test(head)) return "segments";
     if (/^#{2,4}\s+(?:U\d{3}|镜\s*\d{3})\s*[·・]\s*镜头/m.test(head) && /^subject_definitions:/m.test(head)) return "units";
     if (/\.json$/i.test(lower) || /^\uFEFF?\s*\{/.test(head)) return "json";
     if (/\.csv$/i.test(lower) || (/镜头号/.test(head.split(/\r?\n/, 1)[0] || "") && head.includes(","))) return "csv";
@@ -4757,6 +4794,7 @@ export function createStoryboardPanel(root, app) {
     if (/^#{1,3}\s*声音素材清单/m.test(head)) return "voice";
     if (/^#{1,3}\s*(?:素材提示词|素材清单)/m.test(head) || /^###\s*(?:ST|S|C|P|E|R|T|G)-\d{2}\s*[·・]/m.test(head)) return "assets";
     if (/首帧提示词\s*[（(]/.test(head)) return "frames";
+    if (/投喂段清单/.test(head)) return "manifest";
     if (/^#{1,3}\s*.*单元切分清单/m.test(head)) return "manifest";
     const prefix = (String(name || "").match(/^(\d{2})[-_. ]/) || [])[1];
     if (prefix && PACK_FILE_KIND[prefix]) return PACK_FILE_KIND[prefix];
@@ -4804,6 +4842,30 @@ export function createStoryboardPanel(root, app) {
       added += fresh.length;
     });
     return added;
+  }
+
+  /** 13 段清单对账：衔接列决定哪些段接上一段尾帧，镜数 / 素材 / 台词列用来核对 */
+  function applySegmentManifest(rows) {
+    if (!Array.isArray(rows) || !rows.length || !state.doc) return 0;
+    const byId = new Map(state.doc.units.map((unit) => [unit.id, unit]));
+    const diffs = [];
+    let applied = 0;
+    rows.forEach((row) => {
+      const unit = byId.get(`D${row.seg}`);
+      if (!unit) return;
+      unit.continuityFromPrev = /尾帧/.test(String(row.joint || ""));
+      applied += 1;
+      const shots = (unit.shotNumbers || []).length;
+      const assets = (unit.assets || []).length;
+      const lines = (String((unit.sections && unit.sections.detailed_description) || "").match(/<d>/g) || []).length;
+      if (row.shots && row.shots !== shots) diffs.push(`${unit.id} 镜数 ${row.shots}≠${shots}`);
+      if (row.assets && row.assets !== assets) diffs.push(`${unit.id} 素材 ${row.assets}≠${assets}`);
+      if (row.lines && row.lines !== lines) diffs.push(`${unit.id} 台词 ${row.lines}≠${lines}`);
+    });
+    if (diffs.length) {
+      logLine(`段清单对账不一致：${diffs.slice(0, 6).join("、")}${diffs.length > 6 ? "…" : ""}`, "warn");
+    }
+    return applied;
   }
 
   /** 09 JSON 的 assets（编号 / 类型 / 名称）并进当前文档的「编号 → 名称」表 */
@@ -4918,23 +4980,28 @@ export function createStoryboardPanel(root, app) {
       logLine(`已忽略非镜表：${ignored.map((entry) => entry.file.name).join("、")}`, "info");
     }
     if (!usable.length) {
-      toast(PACK_KIND_HINT[entries[0].kind] || "选中的文件里没有镜表（09 / 07 / 05 / 12 / 01）", "info");
+      toast(PACK_KIND_HINT[entries[0].kind] || "选中的文件里没有镜表（09 / 07 / 05 / 13 / 12 / 01）", "info");
       return;
     }
 
-    const primaryOrder = ["units", "json", "csv", "txt", "shots"];
+    // 13 分段投喂优先：每段 ≤15 秒，正好落在 H3 单次 4—15 秒的范围内
+    const primaryOrder = ["segments", "units", "json", "csv", "txt", "shots"];
     const primary = primaryOrder.map((kind) => usable.find((entry) => entry.kind === kind)).find(Boolean);
     const main = primary || usable[0];
     if (!main) return;
     importRaw(main.text, main.file.name);
 
-    // 同一份包的几份镜表：镜数不一致就以主源为准，并在日志里说清楚
+    // 同一份包的几份镜表：镜数不一致就以主源为准，并在日志里说清楚。
+    // 13 是 34 段、12 是 15 单元，直接比单元数没有意义，统一按「覆盖到的全片镜头号」算
     const counts = primaryOrder
       .map((kind) => {
         const entry = usable.find((item) => item.kind === kind);
         if (!entry) return null;
         try {
-          return { kind, total: parseAnyStoryboard(entry.text).units.length, name: entry.file.name };
+          const doc = parseAnyStoryboard(entry.text);
+          const shots = new Set();
+          (doc.units || []).forEach((unit) => unitShotNumbers(unit).forEach((no) => shots.add(no)));
+          return { kind, total: shots.size, name: entry.file.name };
         } catch (error) {
           return null;
         }
@@ -4997,7 +5064,7 @@ export function createStoryboardPanel(root, app) {
         /* JSON 不合法就当没有 */
       }
     } else if (!jsonEntry && state.doc && state.doc.units.some((unit) => unit.structuredPrompt)) {
-      logLine("这次没选 09-分镜表.json：素材编号只能从 12 正文里抽，可能不全；建议整包多选导入", "warn");
+      logLine("这次没选 09-分镜表.json：素材编号只能从正文里抽，可能不全；建议整包多选导入", "warn");
     }
     if (state.doc) {
       const resolved = resolveBindingAssets(state.doc.units, state.doc.assetNames);
@@ -5007,6 +5074,12 @@ export function createStoryboardPanel(root, app) {
       }
       const voiced = resolveAudioRefs(state.doc.units, state.doc.assetNames);
       if (voiced) logLine(`已按名称补上 ${voiced} 条音色参考编号`, "ok");
+      // 13 段清单：衔接列决定 17 / 20 / 25 / 30 接上一段尾帧，其余段首帧图锚定
+      const manifestEntry = entries.find((entry) => entry.kind === "manifest");
+      if (manifestEntry && state.doc.segmentContract) {
+        const applied = applySegmentManifest(parseSegmentManifest(manifestEntry.text));
+        if (applied) logLine(`已按 13 段清单核对 ${applied} 段（衔接 / 镜数 / 素材 / 台词）`, "ok");
+      }
       if (state.doc.units.some((unit) => !(unit.assets || []).length)) {
         const added = mergeShotAssets(state.doc.units, jsonShots);
         if (added) {
