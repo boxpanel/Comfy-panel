@@ -541,6 +541,96 @@ export function parseAssetNames(text) {
   return names;
 }
 
+/** 素材名称归一：去掉括号备注与「类型·」前缀、空格（`声音·宋阳（S1）` → `宋阳`） */
+export function normalizeAssetName(value) {
+  return String(value || "")
+    .replace(/[（(][^）)]*[）)]/g, "")
+    .split(/[·・]/)
+    .pop()
+    .replace(/\s+/g, "")
+    .trim();
+}
+
+// 「素材绑定」里写的类型 → 编号前缀：名字撞车时靠它挑对（宋阳 → 角色 S-01，不是音色 V-01）
+const ASSET_KIND_PREFIX = {
+  角色: ["S-", "R-"],
+  人物: ["R-", "S-"],
+  服装: ["C-"],
+  道具: ["P-", "T-P", "T-"],
+  场景: ["E-"],
+  风格: ["ST-", "T-"],
+  其他: ["A-"],
+  声音: ["V-", "RA-"],
+};
+
+/** 新版 12 单元稿的「素材绑定」只写名字（不给编号）：按 03 / 09 的「编号 → 名称」反查，
+ *  按图位顺序写回 unit.assets（<Picture 1> 必须排第一）。返回改动过的单元数 */
+export function resolveBindingAssets(units, nameMap) {
+  const pairs = Object.entries(nameMap || {});
+  if (!pairs.length) return 0;
+  const byName = new Map();
+  pairs.forEach(([code, label]) => {
+    const key = normalizeAssetName(label);
+    if (!key) return;
+    if (!byName.has(key)) byName.set(key, []);
+    if (!byName.get(key).includes(code)) byName.get(key).push(code);
+  });
+  let matched = 0;
+  (units || []).forEach((unit) => {
+    const binds = Array.isArray(unit && unit.assetBindings) ? unit.assetBindings : [];
+    if (!binds.length) return;
+    const codes = [];
+    binds.forEach((bind) => {
+      if (bind.code) {
+        if (!codes.includes(bind.code)) codes.push(bind.code);
+        return;
+      }
+      const candidates = byName.get(normalizeAssetName(bind.name)) || [];
+      if (!candidates.length) return;
+      const prefixes = ASSET_KIND_PREFIX[bind.kind] || null;
+      const pick =
+        (prefixes && candidates.find((code) => prefixes.some((p) => code.toUpperCase().startsWith(p)))) ||
+        candidates[0];
+      if (pick && !codes.includes(pick)) codes.push(pick);
+    });
+    if (!codes.length) return;
+    if ((unit.assets || []).join(",") !== codes.join(",")) {
+      unit.assets = codes;
+      matched += 1;
+    }
+  });
+  return matched;
+}
+
+/** 音色绑定只有 `名字（S2）` 时，按 03 / 09 的 `V-01=声音·宋阳（S1）` 反查音色编号 */
+export function resolveAudioRefs(units, nameMap) {
+  const pairs = Object.entries(nameMap || {});
+  const bySpeaker = new Map();
+  const byName = new Map();
+  pairs.forEach(([code, label]) => {
+    if (!/^(V|RA)-/i.test(code)) return;
+    const text = String(label || "");
+    const speaker = (text.match(/[（(]\s*(S\d+)\s*[）)]/i) || [])[1];
+    if (speaker && !bySpeaker.has(speaker.toUpperCase())) bySpeaker.set(speaker.toUpperCase(), code);
+    const key = normalizeAssetName(text);
+    if (key && !byName.has(key)) byName.set(key, code);
+  });
+  let filled = 0;
+  (units || []).forEach((unit) => {
+    (unit.audioRefs || []).forEach((ref) => {
+      if (!ref || ref.code) return;
+      const code =
+        (ref.speaker && bySpeaker.get(String(ref.speaker).toUpperCase())) ||
+        byName.get(normalizeAssetName(ref.name)) ||
+        "";
+      if (!code) return;
+      ref.code = code;
+      filled += 1;
+    });
+  });
+  return filled;
+}
+
 // ---------- 标准工作流单元提示词（六段式） ----------
 // 出包端格式：## U001 · 镜头 01—04
 //   - 场景：… ｜ 镜数：4 ｜ 名义 20s ｜ 对齐 481 帧 = 20.042s
@@ -584,34 +674,61 @@ function promptSectionsOf(body) {
   return sections;
 }
 
-/** 素材绑定：`<Picture 1> S-01` 与 `S-01 卫斯理（Picture 1）` 两种写法 */
+/** 素材绑定行里的图位：
+ *  旧：`<Picture 1> S-01 宋阳（角色）`
+ *  新：`<Picture 1> 宋阳（角色） · <Picture 2> 悦来宾馆四楼旧房间（场景）`（不给编号）
+ * 返回 [{ picture, code, name, kind }]，code 可能为空（新版靠名字去 09 素材表对编号）
+ */
 function parsePictureBindings(line) {
   const found = [];
+  const re = /<Picture\s+(\d+)>\s*([^<·|｜、，,\n]*)/g;
   let match;
-  const direct = new RegExp(`<Picture\\s+(\\d+)>\\s*(${STRUCT_CODE_RE})`, "gi");
-  while ((match = direct.exec(line))) {
-    found.push({ picture: Number(match[1]), code: normalizeAssetCode(match[2]) });
-  }
-  if (!found.length) {
-    const trailing = new RegExp(`(${STRUCT_CODE_RE})\\s*[^、，,（(]*[（(]\\s*Picture\\s+(\\d+)\\s*[）)]`, "gi");
-    while ((match = trailing.exec(line))) {
-      found.push({ picture: Number(match[2]), code: normalizeAssetCode(match[1]) });
-    }
+  while ((match = re.exec(String(line || "")))) {
+    const raw = String(match[2] || "").trim();
+    const codeMatch = raw.match(new RegExp(`(${STRUCT_CODE_RE})`, "i"));
+    const code = codeMatch ? normalizeAssetCode(codeMatch[1]) : "";
+    let rest = codeMatch ? raw.replace(codeMatch[0], " ").trim() : raw;
+    rest = rest.replace(/^[·|｜、，,\s]+|[·|｜、，,\s]+$/g, "").trim();
+    // `宋阳（角色）` / `Song Yang (character)`
+    const named = rest.match(/^([^（(]+)[（(]\s*([^）)]*)\s*[）)]/);
+    const name = (named ? named[1] : rest).trim();
+    const kind = named ? String(named[2] || "").trim() : "";
+    if (!code && !name) continue;
+    found.push({ picture: Number(match[1]), code, name, kind });
   }
   return found.sort((a, b) => a.picture - b.picture);
 }
 
-/** 音色绑定：`<Audio 1> S1 卫斯理（V-01）` → 音频槽 / 说话人 / 名称 / 参考音频编号 */
+/** 音色绑定：旧 `S1 卫斯理（V-01）` / 新 `<Audio 1> 宋阳（S1）`
+ *  → { audio, speaker, name, code }，新包不带 V 编号，code 留空等面板按名字补 */
 function parseVoiceBindings(line) {
   const found = [];
-  const re = /<Audio\s+(\d+)>\s*(?:(S\d+)\s*)?([^、，,（(<>\n]*?)\s*(?:[（(]\s*((?:V|RA)-\d{1,2})\s*[）)])?(?=[、，,]|$)/gi;
+  const re = /<Audio\s+(\d+)>\s*([^<·|｜、，,\n]*)/g;
   let match;
-  while ((match = re.exec(line))) {
+  while ((match = re.exec(String(line || "")))) {
+    const raw = String(match[2] || "").trim();
+    if (!raw) continue;
+    const paren = raw.match(/[（(]\s*([^）)]*)\s*[）)]/);
+    const inside = paren ? paren[1].trim() : "";
+    const before = (paren ? raw.slice(0, paren.index) : raw).trim();
+    let speaker = "";
+    let name = before;
+    // 旧写法把说话人放在名字前面
+    const lead = before.match(/^(S\d+)\s*(.*)$/i);
+    if (lead) {
+      speaker = lead[1].toUpperCase();
+      name = lead[2].trim();
+    }
+    if (!speaker) {
+      const insideSpeaker = inside.match(/(?:^|[^A-Za-z0-9])(S\d+)(?![A-Za-z0-9])/i);
+      if (insideSpeaker) speaker = insideSpeaker[1].toUpperCase();
+    }
+    const insideCode = inside.match(/(?:V|RA)-\d{1,2}/i);
     found.push({
       audio: Number(match[1]),
-      speaker: String(match[2] || "").toUpperCase(),
-      name: String(match[3] || "").trim(),
-      code: match[4] ? normalizeAssetCode(match[4]) : "",
+      speaker,
+      name: name.replace(/[（(].*$/, "").trim(),
+      code: insideCode ? normalizeAssetCode(insideCode[0]) : "",
     });
   }
   return found;
@@ -695,20 +812,44 @@ function mergeAudioRefs(voice, defs, retention) {
   return Array.from(map.values()).sort((a, b) => a.audio - b.audio);
 }
 
+/** 单元标题里的镜号：`01—03、05—06（共 5 镜…）` → [1,2,3,5,6]；`04` → [4] */
+function parseShotNumbers(tail) {
+  const text = String(tail || "").replace(/[（(][^）)]*[）)]/g, " ");
+  const found = [];
+  let rest = text;
+  const rangeRe = /(\d+)\s*[—–-]\s*(\d+)/g;
+  let match;
+  while ((match = rangeRe.exec(text))) {
+    const from = Number(match[1]);
+    const to = Number(match[2]);
+    if (!Number.isFinite(from) || !Number.isFinite(to)) continue;
+    for (let no = Math.min(from, to); no <= Math.max(from, to); no += 1) found.push(no);
+    rest = rest.replace(match[0], " ");
+  }
+  const singleRe = /\d+/g;
+  while ((match = singleRe.exec(rest))) found.push(Number(match[0]));
+  return [...new Set(found)].sort((a, b) => a - b);
+}
+
 /** 结构化成片提示词（单元包 / 样张）→ 与旧手册相同的 doc 结构 */
 function parseStructuredPromptPack(text) {
   const unitHeads = [];
   let match;
   // 单元标题有三种出包写法：旧包 `## U001 · 镜头 01—04`、样例新包 `### U001 · 镜头 01—01`、
-  // 正式 zip 包 `## 镜 001 · 镜头 01—06`（「镜」+ 三位数，无 U 前缀）；统一归一成 U 编号
-  const unitRe = /^#{2,4}\s+(?:U(\d{3})|镜\s*(\d{3}))\s*[·・]\s*镜头\s*(\d+)\s*[—–-]\s*(\d+)\s*$/gm;
+  // 正式 zip 包 `## 镜 001 · 镜头 01—06`；新包还会带后缀与多段区间：
+  //   `## 镜 001 · 镜头 01—03、05—06（共 5 镜，镜 04 拆为单独一条）`
+  //   `## 镜 004 · 镜头 04`
+  const unitRe = /^#{2,4}\s+(?:U(\d{3})|镜\s*(\d{3}))\s*[·・]\s*镜头\s*([^\n]+?)\s*$/gm;
   while ((match = unitRe.exec(text))) {
+    const shots = parseShotNumbers(match[3]);
+    if (!shots.length) continue;
     unitHeads.push({
       index: match.index,
       end: match.index + match[0].length,
       uid: `U${match[1] || match[2]}`,
-      from: Number(match[3]),
-      to: Number(match[4]),
+      from: shots[0],
+      to: shots[shots.length - 1],
+      shots,
     });
   }
   if (!unitHeads.length) {
@@ -767,15 +908,26 @@ function parseStructuredPromptPack(text) {
     const pictures = bind ? parsePictureBindings(bind[1]) : [];
     const subjects = parseSubjectDefinitions(sections.subject_definitions);
     pictures.forEach((pic) => {
+      if (!pic.code) return;
       const subject = subjects.find((item) => item.picture === pic.picture);
-      if (!subject || assetNames[pic.code]) return;
-      const label = /[\u4e00-\u9fff]/.test(subject.name) ? subject.name : subject.enName || subject.name;
+      if (assetNames[pic.code]) return;
+      const fromSubject = subject
+        ? /[\u4e00-\u9fff]/.test(subject.name)
+          ? subject.name
+          : subject.enName || subject.name
+        : "";
+      const label = fromSubject || pic.name;
       if (label) assetNames[pic.code] = label;
     });
-    const boundCodes = pictures.map((item) => item.code);
+    const boundCodes = pictures.map((item) => item.code).filter(Boolean);
+    // 新版绑定行只写名字、不给编号（`<Picture 1> 宋阳（角色）`）：这里先留空，
+    // 等面板读入 03 / 09 的「编号 → 名称」后按图位顺序补编号；
+    // 只有整行没有图位（`—（待素材表生成后回填）`）时才从正文抽编号兜底
     const assetCodes = boundCodes.length
       ? boundCodes
-      : extractAssets(`${sections.subject_definitions || ""}\n${sections.summary || ""}`);
+      : pictures.length
+        ? []
+        : extractAssets(`${sections.subject_definitions || ""}\n${sections.summary || ""}`);
     const audioDefs = parseAudioDefinitions(sections.subject_definitions);
     const audioRetention = parseAudioRetention(sections.retention_analysis);
     const voiceBindings = voice ? voice[1].trim() : "";
@@ -791,7 +943,7 @@ function parseStructuredPromptPack(text) {
         summaryText.match(/(?:total\s+)?duration\s*[：:]?\s*(\d+(?:\.\d+)?)\s*seconds?/i) ||
         summaryText.match(/(\d+(?:\.\d+)?)\s*[- ]\s*seconds?\b/i) ||
         summaryText.match(/(\d+(?:\.\d+)?)-second/i);
-      nominal = found ? Number(found[1]) : 5 * Math.max(1, head.to - head.from + 1);
+      nominal = found ? Number(found[1]) : 5 * Math.max(1, (head.shots && head.shots.length) || head.to - head.from + 1);
     }
 
     const id = head.uid;
@@ -821,6 +973,10 @@ function parseStructuredPromptPack(text) {
       // 单元覆盖的全片镜号区间：04 声音与对白表按镜号并台词时用
       shotFrom: head.from,
       shotTo: head.to,
+      // 新包可能是 `01—03、05—06` 这种不连续区间，镜号列表以它为准
+      shotNumbers: head.shots || null,
+      // 素材绑定行的原始图位（名字可能没有编号，导入 09 后按名字补编号）
+      assetBindings: pictures,
       sceneName: meta ? meta[1].trim() : title,
       durationText: nominal ? `${nominal} 秒` : "",
       duration: nominal,

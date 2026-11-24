@@ -12,8 +12,10 @@ import {
   parseAssetNames,
   parseFrameName,
   parseVoiceDialoguePack,
+  resolveAudioRefs,
+  resolveBindingAssets,
   summarize,
-} from "./storyboard_parser.js?v=20261124n";
+} from "./storyboard_parser.js?v=20261124t";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -78,7 +80,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.67 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.69 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -495,6 +497,8 @@ function loadState() {
     log: Array.isArray(saved.log) ? saved.log.slice(-200) : [],
     // 从 09 分镜表按镜号补出来的素材编号（刷新后 raw 重新解析会丢，这里补回去）
     assetExtra: saved.assetExtra && typeof saved.assetExtra === "object" ? saved.assetExtra : {},
+    // 03 / 09 读进来的「编号 → 名称」（不在 raw 里）：新版 12 只有素材名字，刷新后靠它补编号
+    assetNames: saved.assetNames && typeof saved.assetNames === "object" ? saved.assetNames : {},
     draftBase:
       saved.draftBase &&
       typeof saved.draftBase === "object" &&
@@ -593,6 +597,10 @@ export function createStoryboardPanel(root, app) {
   if (state.raw) {
     // raw 可能是 JSON / CSV / txt / 六段式，统一走内容识别；刷新后素材补丁再叠回去
     state.doc = parseAnyStoryboard(state.raw);
+    // 03 / 09 的「编号 → 名称」不在 raw 里，先叠回来；新版 12 只有素材名字，靠它补编号
+    state.doc.assetNames = { ...(state.assetNames || {}), ...(state.doc.assetNames || {}) };
+    resolveBindingAssets(state.doc.units, state.doc.assetNames);
+    resolveAudioRefs(state.doc.units, state.doc.assetNames);
     applyStoredUnitAssets();
     // 载入诊断：整份分镜一个素材编号都没有时，把原因写进日志，免得只看到「本批素材 0 行」
     const units = state.doc.units || [];
@@ -899,6 +907,7 @@ export function createStoryboardPanel(root, app) {
           verdict: state.verdict,
           log: state.log.slice(-200),
           assetExtra: state.assetExtra,
+          assetNames: (state.doc && state.doc.assetNames) || state.assetNames || {},
           draftBase: state.draftBase,
           quality: state.quality,
           selected: state.selected,
@@ -2141,10 +2150,15 @@ export function createStoryboardPanel(root, app) {
     const file = fileHandles.get(entry.path);
     if (!file) return null;
     try {
+      // 服务器 input 里已有同名同大小的帧图就复用，重选素材库不白传
+      if (await inputFileExists(entry.name, file.size)) {
+        entry.uploadedFrameName = entry.name;
+        return entry.name;
+      }
       const form = new FormData();
       form.append("image", file, entry.name);
       form.append("overwrite", "true");
-      const response = await fetch("/upload/image", { method: "POST", body: form });
+      const response = await api.fetchApi("/upload/image", { method: "POST", body: form });
       if (!response.ok) return null;
       const data = await response.json();
       const name = data && data.name ? (data.subfolder ? `${data.subfolder}/${data.name}` : data.name) : "";
@@ -3144,13 +3158,24 @@ export function createStoryboardPanel(root, app) {
   }
 
   /** ComfyUI input 目录里是否已经有这个文件（重选素材库后 uploadedName 被清空，但文件其实还在服务器上） */
-  async function inputFileExists(name) {
+  async function inputFileExists(name, size = null) {
     if (!name) return false;
     const query = new URLSearchParams({ filename: name, type: "input", subfolder: "" });
-    const url = typeof api.apiURL === "function" ? api.apiURL(`/view?${query.toString()}`) : `/view?${query}`;
+    const route = `/view?${query.toString()}`;
     try {
-      const response = await fetch(url, { method: "HEAD", cache: "no-store" });
-      return response.ok;
+      // 必须走 api.fetchApi：裸 fetch 不带登录凭据，pod 网关会回「需要授权」
+      const response =
+        typeof api.fetchApi === "function"
+          ? await api.fetchApi(route, { method: "HEAD", cache: "no-store" })
+          : await fetch(typeof api.apiURL === "function" ? api.apiURL(route) : route, {
+              method: "HEAD",
+              cache: "no-store",
+            });
+      if (!response.ok) return false;
+      // 服务器给了大小就顺便比一下：同名但内容换过（大小不同）就重新上传
+      const remote = Number(response.headers.get("Content-Length"));
+      if (size && Number.isFinite(remote) && remote > 0 && remote !== Number(size)) return false;
+      return true;
     } catch (error) {
       return false;
     }
@@ -3160,17 +3185,18 @@ export function createStoryboardPanel(root, app) {
     if (entry.uploadedName) return entry.uploadedName;
     if (!entry.image && !entry.audio) return null;
     let file = fileHandles.get(entry.path);
-    if (!file) {
-      // 刷新页面后拿不到文件句柄：先看服务器 input 里是否已有同名文件，有就直接沿用
-      if (!(entry.image && settings().cutout) && (await inputFileExists(entry.name))) {
-        entry.uploadedName = entry.name;
-        entry.uploadError = "";
-        if (persistNow) {
-          saveLibraryStore();
-          persist();
-        }
-        return entry.name;
+    // 没勾抠图时，服务器 input 里已有同名同大小的文件就直接复用；
+    // 这样重选素材库不会把整批文件再白传一遍
+    if (!(entry.image && settings().cutout) && (await inputFileExists(entry.name, file ? file.size : null))) {
+      entry.uploadedName = entry.name;
+      entry.uploadError = "";
+      if (persistNow) {
+        saveLibraryStore();
+        persist();
       }
+      return entry.name;
+    }
+    if (!file) {
       entry.uploadError = "本次会话没有这个文件（刷新/切页后要重新点「素材库」选文件夹）";
       return null;
     }
@@ -3190,7 +3216,7 @@ export function createStoryboardPanel(root, app) {
       const form = new FormData();
       form.append("image", file, uploadName);
       form.append("overwrite", "true");
-      const response = await fetch("/upload/image", { method: "POST", body: form });
+      const response = await api.fetchApi("/upload/image", { method: "POST", body: form });
       if (!response.ok) {
         entry.uploadError = `服务器返回 ${response.status}${response.statusText ? " " + response.statusText : ""}`;
         return null;
@@ -4738,8 +4764,9 @@ export function createStoryboardPanel(root, app) {
     return "";
   }
 
-  /** 一个单元覆盖的全片镜头号：六段式单元用 shotFrom..shotTo，单镜卡用 label 转数字 */
+  /** 一个单元覆盖的全片镜头号：六段式单元用 shotNumbers / shotFrom..shotTo，单镜卡用 label 转数字 */
   function unitShotNumbers(unit) {
+    if (Array.isArray(unit && unit.shotNumbers) && unit.shotNumbers.length) return unit.shotNumbers;
     if (unit.shotFrom != null && unit.shotTo != null) {
       const out = [];
       for (let no = unit.shotFrom; no <= unit.shotTo; no += 1) out.push(no);
@@ -4775,6 +4802,21 @@ export function createStoryboardPanel(root, app) {
       if (!fresh.length) return;
       unit.audio = [String(unit.audio || "").trim(), ...fresh].filter(Boolean).join("；");
       added += fresh.length;
+    });
+    return added;
+  }
+
+  /** 09 JSON 的 assets（编号 / 类型 / 名称）并进当前文档的「编号 → 名称」表 */
+  function mergePackAssetNames(assets) {
+    if (!Array.isArray(assets) || !assets.length || !state.doc) return 0;
+    const names = state.doc.assetNames || (state.doc.assetNames = {});
+    let added = 0;
+    assets.forEach((item) => {
+      const id = String((item && item.id) || "").trim();
+      const name = String((item && item.name) || "").trim();
+      if (!id || !name || names[id]) return;
+      names[id] = name;
+      added += 1;
     });
     return added;
   }
@@ -4941,22 +4983,39 @@ export function createStoryboardPanel(root, app) {
         }
       }
     }
-    // 12 单元稿的「素材绑定」常是「待回填」：按镜号从 09 JSON 的 assetRefs 补素材编号
+    // 12 单元稿的「素材绑定」常是「待回填」，新版更是只写名字不给编号：
+    // 先按 03 / 09 的名称表按图位顺序补，补不到的再按镜号从 09 的 assetRefs 兜底
     const jsonEntry = entries.find((entry) => entry.kind === "json");
-    if (jsonEntry && state.doc && state.doc.units.some((unit) => !(unit.assets || []).length)) {
+    let jsonShots = [];
+    if (jsonEntry && state.doc) {
       try {
         const data = JSON.parse(jsonEntry.text);
-        const added = mergeShotAssets(state.doc.units, Array.isArray(data.shots) ? data.shots : []);
-        if (added) {
-          renderList();
-          logLine(`已从 09 分镜表按镜号补 ${added} 条素材编号`, "ok");
-        }
+        jsonShots = Array.isArray(data.shots) ? data.shots : [];
+        const merged = mergePackAssetNames(Array.isArray(data.assets) ? data.assets : []);
+        if (merged) logLine(`已从 09 分镜表读入 ${merged} 条素材名称`, "ok");
       } catch (error) {
         /* JSON 不合法就当没有 */
       }
     } else if (!jsonEntry && state.doc && state.doc.units.some((unit) => unit.structuredPrompt)) {
       logLine("这次没选 09-分镜表.json：素材编号只能从 12 正文里抽，可能不全；建议整包多选导入", "warn");
     }
+    if (state.doc) {
+      const resolved = resolveBindingAssets(state.doc.units, state.doc.assetNames);
+      if (resolved) {
+        renderList();
+        logLine(`已按名称补上 ${resolved} 个单元的素材编号`, "ok");
+      }
+      const voiced = resolveAudioRefs(state.doc.units, state.doc.assetNames);
+      if (voiced) logLine(`已按名称补上 ${voiced} 条音色参考编号`, "ok");
+      if (state.doc.units.some((unit) => !(unit.assets || []).length)) {
+        const added = mergeShotAssets(state.doc.units, jsonShots);
+        if (added) {
+          renderList();
+          logLine(`已从 09 分镜表按镜号补 ${added} 条素材编号`, "ok");
+        }
+      }
+    }
+    persist();
     if (entries.some((entry) => entry.kind === "frames")) {
       logLine("02 首尾帧表暂不单独导入（首尾帧已随 09 / 12 进卡）", "info");
     }
