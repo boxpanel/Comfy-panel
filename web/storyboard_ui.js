@@ -43,6 +43,7 @@ import {
   getNodeById,
   getNodes,
   getPlanResolution,
+  H3_MEGAPIXELS,
   hasReferenceConditioning,
   listNodeOptions,
   pruneReferenceNodes,
@@ -71,13 +72,13 @@ import {
   writePlanPromptPrefix,
   writeRuleBridgeText,
   writeH3Shot,
-} from "./storyboard_bridge.js?v=20261124b";
+} from "./storyboard_bridge.js?v=20261124c";
 
 const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.66 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.67 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -102,6 +103,11 @@ const DEFAULT_SETTINGS = {
   // 按分镜文字自动开关武打 LoRA：导演口径默认不用，需要时手动勾
   fightAuto: false,
   referenceRule: "",
+  // 画质下拉后面手填的档位：空 = 用默认（草稿 6 步 / 0.25MP，成片按单元档位 / 1.5MP）
+  stepsDraft: null,
+  stepsFinal: null,
+  mpDraft: null,
+  mpFinal: null,
   nodeIds: { positive: "", negative: "", sampler: "", latent: "", image: "" },
 };
 
@@ -202,6 +208,7 @@ const CSS = `
 }
 .sb-frame select:focus{outline:none;border-color:var(--sb-accent);}
 .sb-frame select[data-el="draft-select"]{flex:0 0 auto;width:64px;}
+.sb-frame input.sb-num{flex:0 0 auto;width:56px;padding:2px 4px;font-size:11px;}
 .sb-frame .sb-btn{padding:2px 7px;font-size:10px;}
 .sb-ov{width:100%;border-collapse:collapse;font-size:10px;}
 .sb-ov-bar{display:flex;align-items:center;gap:6px;margin-bottom:6px;}
@@ -786,10 +793,14 @@ export function createStoryboardPanel(root, app) {
       </div>
       <div class="sb-frame" data-el="draft-row" hidden>
         <span class="label">画质</span>
-        <select data-el="draft-select" title="草稿：计划链 640 宽 + 6 步；原生 Ref2V 0.25MP + 6 步。成片：按工作流原始画质与步数">
+        <select data-el="draft-select" title="草稿：低分辨率 + 少步数快速试跑；成片：按分镜分辨率生成">
           <option value="final">成片</option>
           <option value="draft">草稿</option>
         </select>
+        <span class="label">步数</span>
+        <input class="sb-num" type="number" min="1" max="60" step="1" data-el="quality-steps" title="当前档位的采样步数；改完按这个值生成">
+        <span class="label">像素</span>
+        <input class="sb-num" type="number" min="0.1" max="4" step="0.05" data-el="quality-mp" title="当前档位的像素档；改完按这个值生成">
         <span class="sb-hint" data-el="draft-text"></span>
       </div>
       <div class="sb-frame">
@@ -1326,13 +1337,13 @@ export function createStoryboardPanel(root, app) {
     return unit && state.selected[unit.id] !== false;
   }
 
-  /** 总清单里显示的步数：草稿档显示实际会跑的步数 */
-  function displaySteps(params) {
+  /** 总清单里显示的步数：草稿档显示实际会跑的步数，成片档显示面板上填的值（没填按单元档位） */
+  function displaySteps(unit) {
     const base = state.draftBase;
-    if (!base) return params.steps;
+    if (!base) return finalStepsValue(unit);
     // 原生 Ref2V 没有采样器步数控件时，步数不受草稿影响
-    if (base.native && base.steps == null) return params.steps;
-    return DRAFT_STEPS;
+    if (base.native && base.steps == null) return finalStepsValue(unit);
+    return draftStepsValue();
   }
 
   function renderOverview() {
@@ -1361,7 +1372,7 @@ export function createStoryboardPanel(root, app) {
           <td>${escapeHtml(unit.tier)}</td>
           <td>${escapeHtml(unit.durationText || "-")}</td>
           <td>${escapeHtml(unit.shot || "-")}</td>
-          <td>${displaySteps(params)}</td>
+          <td>${displaySteps(unit)}</td>
           <td>${escapeHtml(params.sampler)}</td>
           <td>${params.shift}</td>
           <td>${escapeHtml(unit.id + "_")}</td>
@@ -1822,6 +1833,44 @@ export function createStoryboardPanel(root, app) {
     return frames;
   }
 
+  /** 草稿步数：面板上填过就用填的，没填按 DRAFT_STEPS */
+  function draftStepsValue() {
+    const raw = Math.round(Number(settings().stepsDraft));
+    return Number.isFinite(raw) && raw >= 1 ? raw : DRAFT_STEPS;
+  }
+
+  /** 成片步数：面板上填过就用填的，没填按单元档位（A/B/C） */
+  function finalStepsValue(unit) {
+    const raw = Math.round(Number(settings().stepsFinal));
+    if (Number.isFinite(raw) && raw >= 1) return raw;
+    const fromUnit = Math.round(Number(unit && unit.params && unit.params.steps));
+    return Number.isFinite(fromUnit) && fromUnit >= 1 ? fromUnit : 8;
+  }
+
+  /** 草稿像素档：面板上填过就用填的，没填按 DRAFT_MEGAPIXELS */
+  function draftMegapixelsValue() {
+    const raw = Number(settings().mpDraft);
+    return Number.isFinite(raw) && raw > 0 ? raw : DRAFT_MEGAPIXELS;
+  }
+
+  /** 成片像素档：面板上填过就用填的，没填按 H3_MEGAPIXELS */
+  function finalMegapixelsValue() {
+    const raw = Number(settings().mpFinal);
+    return Number.isFinite(raw) && raw > 0 ? raw : H3_MEGAPIXELS;
+  }
+
+  /** 按像素档 + 画面比例算宽高（对齐到 8） */
+  function sizeForMegapixels(megapixels, aspectWidth, aspectHeight) {
+    const mp = Number(megapixels);
+    const aw = Number(aspectWidth) > 0 ? Number(aspectWidth) : 16;
+    const ah = Number(aspectHeight) > 0 ? Number(aspectHeight) : 9;
+    if (!(mp > 0)) return null;
+    const aspect = aw / ah;
+    const width = Math.max(64, Math.round(Math.sqrt(mp * 1e6 * aspect) / 8) * 8);
+    const height = Math.max(64, Math.round(width / aspect / 8) * 8);
+    return { width, height };
+  }
+
   /** 草稿分辨率：宽固定 640，高按原比例对齐到 8（16:9 就是 640×360） */
   function draftSize(width, height) {
     const sourceWidth = Number(width) > 0 ? Number(width) : 1280;
@@ -1832,8 +1881,9 @@ export function createStoryboardPanel(root, app) {
   }
 
   function draftTargetSize(draft) {
-    // 每次按当前成片尺寸重算，避免旧的草稿尺寸（比如半分辨率）残留在存档里
-    return draftSize(draft.width, draft.height);
+    // 每次按当前成片尺寸重算，避免旧的草稿尺寸（比如半分辨率）残留在存档里；
+    // 面板上手填过草稿像素档时，按手填的像素算
+    return sizeForMegapixels(Number(settings().mpDraft), draft.width, draft.height) || draftSize(draft.width, draft.height);
   }
 
   /** 草稿只在提交队列时替换参数：计划节点与工作流文件都不改 */
@@ -1850,7 +1900,7 @@ export function createStoryboardPanel(root, app) {
     try {
       const plan = JSON.parse(entry.inputs.plan_json || "{}");
       for (const shot of plan.shots || []) {
-        if (shot && typeof shot === "object") shot.steps = DRAFT_STEPS;
+        if (shot && typeof shot === "object") shot.steps = draftStepsValue();
       }
       entry.inputs.plan_json = JSON.stringify(plan);
     } catch (error) {
@@ -1905,18 +1955,31 @@ export function createStoryboardPanel(root, app) {
     if (el["draft-select"]) {
       el["draft-select"].value = base ? "draft" : state.quality === "final" ? "final" : "draft";
     }
+    // 下拉框后面的步数 / 像素：显示当前档位实际会用的值，改完立即生效
+    const firstUnit = state.doc && state.doc.units && state.doc.units.length ? state.doc.units[0] : null;
+    const canMp = !!info || !!(native && native.megapixels != null);
+    if (el["quality-steps"]) {
+      el["quality-steps"].value = String(base ? draftStepsValue() : finalStepsValue(firstUnit));
+      el["quality-steps"].disabled = false;
+    }
+    if (el["quality-mp"]) {
+      el["quality-mp"].value = String(base ? draftMegapixelsValue() : finalMegapixelsValue());
+      el["quality-mp"].disabled = !canMp;
+      el["quality-mp"].title = canMp
+        ? "当前档位的像素档；改完按这个值生成（计划链会直接改计划宽高）"
+        : "当前工作流没有可写的像素控件";
+    }
     if (info) {
       el["draft-text"].textContent = base
-        ? `草稿（仅本次运行）${draftTargetSize(base).width}×${draftTargetSize(base).height} · ${DRAFT_STEPS} 步；分镜记录 ${info.width}×${info.height}`
-        : `成片 ${info.width}×${info.height}`;
+        ? `草稿（仅本次运行）${draftTargetSize(base).width}×${draftTargetSize(base).height} · ${draftStepsValue()} 步；成片 ${info.width}×${info.height} · ${finalStepsValue(firstUnit)} 步`
+        : `成片 ${info.width}×${info.height} · ${finalStepsValue(firstUnit)} 步`;
       return;
     }
-    const finalMegapixels = base && base.native ? base.megapixels : native ? native.megapixels : null;
-    const finalText = finalMegapixels != null ? `${finalMegapixels}MP` : "原画幅";
-    const draftText = native && native.megapixels != null ? `${DRAFT_MEGAPIXELS}MP` : "原画幅";
+    const finalText = canMp ? `${finalMegapixelsValue()}MP` : "原画幅";
+    const draftText = canMp ? `${draftMegapixelsValue()}MP` : "原画幅";
     el["draft-text"].textContent = base
-      ? `草稿（仅本次运行）${draftText} · ${DRAFT_STEPS} 步；成片 ${finalText}`
-      : `成片 ${finalText}`;
+      ? `草稿（仅本次运行）${draftText} · ${draftStepsValue()} 步；成片 ${finalText}`
+      : `成片 ${finalText} · ${finalStepsValue(firstUnit)} 步`;
   }
 
   function enterDraft(silent = false) {
@@ -1926,7 +1989,7 @@ export function createStoryboardPanel(root, app) {
     }
     const info = getPlanResolution(app);
     if (info) {
-      const size = draftSize(info.width, info.height);
+      const size = draftTargetSize({ width: info.width, height: info.height });
       state.draftBase = {
         nodeId: info.nodeId,
         width: info.width,
@@ -1941,7 +2004,7 @@ export function createStoryboardPanel(root, app) {
       renderOverview();
       if (silent) return;
       toast(
-        `草稿模式：运行时临时 ${size.width}×${size.height}、${DRAFT_STEPS} 步；分镜里仍是 ${info.width}×${info.height}，确认后点「成片」`,
+        `草稿模式：运行时临时 ${size.width}×${size.height}、${draftStepsValue()} 步；分镜里仍是 ${info.width}×${info.height}，确认后点「成片」`,
         "ok"
       );
       return;
@@ -1961,8 +2024,8 @@ export function createStoryboardPanel(root, app) {
     renderOverview();
     if (silent) return;
     toast(
-      `草稿模式：${native && native.megapixels != null ? `${DRAFT_MEGAPIXELS}MP` : "原画幅"}${
-        steps != null ? ` · ${DRAFT_STEPS} 步` : ""
+      `草稿模式：${native && native.megapixels != null ? `${draftMegapixelsValue()}MP` : "原画幅"}${
+        steps != null ? ` · ${draftStepsValue()} 步` : ""
       }；确认后点「成片」`,
       "ok"
     );
@@ -3657,9 +3720,22 @@ export function createStoryboardPanel(root, app) {
           ? Number(unit.duration)
           : Number(unit.params.frames) / (Number(unit.params.fps) || 16);
       const frames = Number(unit.frames) > 0 ? Number(unit.frames) : alignedFrames(seconds);
-      const steps = unit.params.steps;
+      const steps = finalStepsValue(unit);
       const result = writeH3Shot(app, target, { steps, seed: String(seed), length: frames });
       if (!result.ok) return { ok: false, message: result.message };
+      // 成片像素档：面板上填过才改计划宽高；没填就保持工作流原来的
+      let resolutionNote = "";
+      if (!state.draftBase && Number(settings().mpFinal) > 0) {
+        const current = getPlanResolution(app);
+        const size = sizeForMegapixels(
+          Number(settings().mpFinal),
+          current ? current.width : unit.params.width,
+          current ? current.height : unit.params.height
+        );
+        if (size && setPlanResolution(app, size.width, size.height).ok) {
+          resolutionNote = `、画幅 ${size.width}×${size.height}`;
+        }
+      }
       const fpsFixed = ensureH3Fps(app);
       state.planIndex = result.index;
       renderPlanRow();
@@ -3667,8 +3743,8 @@ export function createStoryboardPanel(root, app) {
         ok: true,
         message: `H3 计划第 ${result.index + 1} 镜：步数 ${steps}、种子 ${seed}、时长 ${frames} 帧（${(frames / 24).toFixed(
           1
-        )} 秒）；采样器/画幅由计划节点控制，未改${
-          state.draftBase ? `；草稿运行时临时 ${DRAFT_STEPS} 步` : ""
+        )} 秒）${resolutionNote}；采样器由计划节点控制，未改${
+          state.draftBase ? `；草稿运行时临时 ${draftStepsValue()} 步` : ""
         }${fpsFixed.length ? `；已把 H3 帧率修正为 24（节点 ${fpsFixed.join("、")}）` : ""}`,
       };
     }
@@ -3966,8 +4042,10 @@ export function createStoryboardPanel(root, app) {
     // 原生 Ref2V 的草稿状态记在 draftBase.native 里，写入时统一按草稿像素档/步数走
     const nativeDraft = !!(state.draftBase && state.draftBase.native);
     const params = applyParamsToUnit(unit, {
-      megapixels: nativeDraft ? DRAFT_MEGAPIXELS : null,
-      draftSteps: nativeDraft ? DRAFT_STEPS : null,
+      megapixels: nativeDraft ? draftMegapixelsValue() : finalMegapixelsValue(),
+      draftSteps: nativeDraft ? draftStepsValue() : null,
+      // 成片步数：面板上填过就用填的，没填走单元档位
+      steps: nativeDraft ? null : finalStepsValue(unit),
     });
     const fight = applyUnitFight(unit);
     const ok = prompt.ok && params.ok && image.ok;
@@ -4230,7 +4308,7 @@ export function createStoryboardPanel(root, app) {
     const scope = autoScope();
     logLine(
       `自动模式开始：共 ${state.doc.units.length} 镜，勾选 ${scope.units.length} 镜，${
-        state.draftBase ? `草稿档（${DRAFT_STEPS} 步）` : "成片档"
+        state.draftBase ? `草稿档（${draftStepsValue()} 步）` : "成片档"
       }`
     );
     let done = 0;
@@ -5281,6 +5359,63 @@ export function createStoryboardPanel(root, app) {
     // 切换失败（工作流没有可调控件）时把下拉框拨回真实状态
     updateDraftRow();
   });
+
+  // 手填步数 / 像素：按当前档位（草稿或成片）记住，后面应用和全自动都按这个值走
+  if (el["quality-steps"]) {
+    el["quality-steps"].addEventListener("change", () => {
+      // 清空 = 恢复默认（草稿 6 步 / 成片按单元档位）
+      if (String(el["quality-steps"].value).trim() === "") {
+        if (state.draftBase) settings().stepsDraft = null;
+        else settings().stepsFinal = null;
+        persist();
+        updateDraftRow();
+        renderOverview();
+        return;
+      }
+      const value = Math.round(Number(el["quality-steps"].value));
+      if (!Number.isFinite(value) || value < 1) {
+        updateDraftRow();
+        return;
+      }
+      if (state.draftBase) settings().stepsDraft = value;
+      else settings().stepsFinal = value;
+      persist();
+      updateDraftRow();
+      renderOverview();
+      toast(`步数已设为 ${value}（${state.draftBase ? "草稿" : "成片"}）`, "ok");
+    });
+  }
+
+  if (el["quality-mp"]) {
+    el["quality-mp"].addEventListener("change", () => {
+      // 清空 = 恢复默认（草稿 0.25MP / 成片 1.5MP）
+      if (String(el["quality-mp"].value).trim() === "") {
+        if (state.draftBase) settings().mpDraft = null;
+        else settings().mpFinal = null;
+        persist();
+        updateDraftRow();
+        renderOverview();
+        return;
+      }
+      const value = Math.round(Number(el["quality-mp"].value) * 100) / 100;
+      if (!Number.isFinite(value) || value <= 0) {
+        updateDraftRow();
+        return;
+      }
+      if (state.draftBase) settings().mpDraft = value;
+      else settings().mpFinal = value;
+      // 计划链成片：像素档直接写计划宽高，改完立刻能看到新画幅
+      if (!state.draftBase) {
+        const current = getPlanResolution(app);
+        const size = current ? sizeForMegapixels(value, current.width, current.height) : null;
+        if (size) setPlanResolution(app, size.width, size.height);
+      }
+      persist();
+      updateDraftRow();
+      renderOverview();
+      toast(`像素档已设为 ${value}MP（${state.draftBase ? "草稿" : "成片"}）`, "ok");
+    });
+  }
 
   el["refresh-images"].addEventListener("click", () => {
     loadImageFiles();

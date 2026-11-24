@@ -5,7 +5,7 @@
 const TEXT_WIDGETS = ["text", "prompt", "string"];
 
 /** 桥接模块构建号：面板徽标里一起显示，用来确认浏览器加载的是新代码 */
-export const BRIDGE_BUILD = "20261124b";
+export const BRIDGE_BUILD = "20261124c";
 
 /** 只返回真正参与执行的工作流节点（排除静音 mode 2 与旁路 mode 4） */
 export function getNodes(app) {
@@ -459,7 +459,7 @@ export function clearFrameImage(app, kind) {
 export const H3_FPS = 24;
 
 // 成片像素档：分镜手册只用来定画面比例，像素统一按 1.5MP（1664×928）跑
-const H3_MEGAPIXELS = 1.5;
+export const H3_MEGAPIXELS = 1.5;
 
 /** H3 的帧率固定 24；把被误写成 16/其他值的 H3 节点修正回来，返回修正过的节点号 */
 export function ensureH3Fps(app) {
@@ -2391,7 +2391,9 @@ export function applyUnitParams(app, unit, settings, targets, options = {}) {
     }
   };
 
-  setSampler(["steps"], params.steps, "步数");
+  // 面板上手动改过步数时优先用它；没改过就按单元档位（A/B/C）走
+  const stepOverride = Math.round(Number(options.steps) || 0);
+  setSampler(["steps"], stepOverride > 0 ? stepOverride : params.steps, "步数");
   setSampler(["cfg"], params.cfg, "CFG");
   setSampler(["sampler_name", "sampler"], params.sampler, "采样器");
   setSampler(["scheduler"], params.scheduler, "调度器");
