@@ -16,7 +16,7 @@ import {
   resolveAudioRefs,
   resolveBindingAssets,
   summarize,
-} from "./storyboard_parser.js?v=20261125a";
+} from "./storyboard_parser.js?v=20261126a";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -81,7 +81,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.70 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.71 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -4856,9 +4856,16 @@ export function createStoryboardPanel(root, app) {
       unit.continuityFromPrev = /尾帧/.test(String(row.joint || ""));
       applied += 1;
       const shots = (unit.shotNumbers || []).length;
-      const assets = (unit.assets || []).length;
+      // 素材数按「素材绑定」的 <Picture> 张数算，不用解析后的编号数（编号可能有个别没对上）
+      const assets = (unit.assetBindings || []).length;
       const lines = (String((unit.sections && unit.sections.detailed_description) || "").match(/<d>/g) || []).length;
       if (row.shots && row.shots !== shots) diffs.push(`${unit.id} 镜数 ${row.shots}≠${shots}`);
+      if (row.seconds && Math.abs(row.seconds - Number(unit.duration)) > 0.15) {
+        diffs.push(`${unit.id} 时长 ${row.seconds}≠${unit.duration}`);
+      }
+      if (row.frames && unit.nominalFrames && row.frames !== unit.nominalFrames) {
+        diffs.push(`${unit.id} 帧数 ${row.frames}≠${unit.nominalFrames}`);
+      }
       if (row.assets && row.assets !== assets) diffs.push(`${unit.id} 素材 ${row.assets}≠${assets}`);
       if (row.lines && row.lines !== lines) diffs.push(`${unit.id} 台词 ${row.lines}≠${lines}`);
     });
@@ -4868,15 +4875,67 @@ export function createStoryboardPanel(root, app) {
     return applied;
   }
 
+  /** 09 是唯一事实来源：段时长对账；绑定角色不在该段 09 assetRefs 并集里时只提示（可能是画外仍在场） */
+  function crossCheckWithShots(units, shots) {
+    if (!Array.isArray(shots) || !shots.length || !state.doc || !state.doc.segmentContract) return;
+    const byShot = new Map();
+    shots.forEach((shot) => byShot.set(Number(shot && shot.shot), shot));
+    const durationDiffs = [];
+    const castHints = [];
+    (units || []).forEach((unit) => {
+      const union = new Set();
+      let sum = 0;
+      let missing = 0;
+      unitShotNumbers(unit).forEach((no) => {
+        const shot = byShot.get(no);
+        if (!shot) {
+          missing += 1;
+          return;
+        }
+        const seconds = parseFloat(String(shot.duration || ""));
+        if (Number.isFinite(seconds)) sum += seconds;
+        (Array.isArray(shot.assetRefs) ? shot.assetRefs : []).forEach((code) => union.add(code));
+      });
+      if (missing) {
+        durationDiffs.push(`${unit.id} 缺 ${missing} 镜`);
+      } else if (Math.abs(sum - Number(unit.duration)) > 0.2) {
+        durationDiffs.push(`${unit.id} ${unit.duration}≠${sum.toFixed(1)}`);
+      }
+      const offscreen = /off-screen/i.test(String((unit.sections && unit.sections.retention_analysis) || ""));
+      const absent = (unit.assets || []).filter((code) => /^(S|R)-/.test(code) && !union.has(code));
+      if (absent.length && !offscreen) castHints.push(`${unit.id} ${absent.join("/")}`);
+    });
+    if (durationDiffs.length) {
+      logLine(
+        `与 09 对账：${durationDiffs.length} 段时长不一致（${durationDiffs.slice(0, 5).join("、")}${
+          durationDiffs.length > 5 ? "…" : ""
+        }）`,
+        "warn"
+      );
+    }
+    if (castHints.length) {
+      logLine(
+        `提示：${castHints.length} 段绑了 09 该段 assetRefs 里没有的角色（${castHints.slice(0, 5).join("、")}${
+          castHints.length > 5 ? "…" : ""
+        }）；若为画外仍在场，请在 retention 标 off-screen`,
+        "info"
+      );
+    }
+  }
+
   /** 09 JSON 的 assets（编号 / 类型 / 名称）并进当前文档的「编号 → 名称」表 */
   function mergePackAssetNames(assets) {
     if (!Array.isArray(assets) || !assets.length || !state.doc) return 0;
     const names = state.doc.assetNames || (state.doc.assetNames = {});
+    // 12 / 13 主源时，doc 里的名称是从绑定行猜的，09 的正式名称优先
+    const authoritative = !!state.doc.structured;
     let added = 0;
     assets.forEach((item) => {
       const id = String((item && item.id) || "").trim();
       const name = String((item && item.name) || "").trim();
-      if (!id || !name || names[id]) return;
+      if (!id || !name) return;
+      if (names[id] === name) return;
+      if (names[id] && !authoritative) return;
       names[id] = name;
       added += 1;
     });
@@ -5025,7 +5084,9 @@ export function createStoryboardPanel(root, app) {
       const existing = state.doc.assetNames || {};
       const added = Object.keys(names).filter((code) => !existing[code]);
       if (Object.keys(names).length) {
-        const merged = { ...names, ...existing };
+        // 12 / 13 单元稿正文里的名称是从「素材绑定」行猜的（`E-02 正打机位基准图` 这种会把场景编号当名字），
+        // 有 03 素材表时以 03 为准；其他来源（09 主源）仍以文档自带的为准
+        const merged = state.doc.structured ? { ...existing, ...names } : { ...names, ...existing };
         // 六段式正文里场景/道具只有英文名；03 有中文名时以中文为准
         Object.keys(names).forEach((code) => {
           const oldName = existing[code];
@@ -5078,8 +5139,9 @@ export function createStoryboardPanel(root, app) {
       const manifestEntry = entries.find((entry) => entry.kind === "manifest");
       if (manifestEntry && state.doc.segmentContract) {
         const applied = applySegmentManifest(parseSegmentManifest(manifestEntry.text));
-        if (applied) logLine(`已按 13 段清单核对 ${applied} 段（衔接 / 镜数 / 素材 / 台词）`, "ok");
+        if (applied) logLine(`已按 13 段清单核对 ${applied} 段（镜数 / 时长 / 帧数 / 素材 / 台词）`, "ok");
       }
+      if (jsonShots.length) crossCheckWithShots(state.doc.units, jsonShots);
       if (state.doc.units.some((unit) => !(unit.assets || []).length)) {
         const added = mergeShotAssets(state.doc.units, jsonShots);
         if (added) {

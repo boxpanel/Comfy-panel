@@ -581,16 +581,17 @@ export function resolveBindingAssets(units, nameMap) {
     if (!binds.length) return;
     const codes = [];
     binds.forEach((bind) => {
-      if (bind.code) {
-        if (!codes.includes(bind.code)) codes.push(bind.code);
-        return;
-      }
+      // 先按整串名字对：新规则包 `<Picture 5> E-02 正打机位基准图（其他）` 里的 E-02 是场景前缀，
+      // 这张图真正的编号是 A-04；按名字「E-02正打机位基准图」才认得出来
       const candidates = byName.get(normalizeAssetName(bind.name)) || [];
-      if (!candidates.length) return;
-      const prefixes = ASSET_KIND_PREFIX[bind.kind] || null;
-      const pick =
-        (prefixes && candidates.find((code) => prefixes.some((p) => code.toUpperCase().startsWith(p)))) ||
-        candidates[0];
+      let pick = "";
+      if (candidates.length) {
+        const prefixes = ASSET_KIND_PREFIX[bind.kind] || null;
+        pick =
+          (prefixes && candidates.find((code) => prefixes.some((p) => code.toUpperCase().startsWith(p)))) ||
+          candidates[0];
+      }
+      if (!pick && bind.code) pick = bind.code;
       if (pick && !codes.includes(pick)) codes.push(pick);
     });
     if (!codes.length) return;
@@ -678,7 +679,10 @@ function promptSectionsOf(body) {
 /** 素材绑定行里的图位：
  *  旧：`<Picture 1> S-01 宋阳（角色）`
  *  新：`<Picture 1> 宋阳（角色） · <Picture 2> 悦来宾馆四楼旧房间（场景）`（不给编号）
- * 返回 [{ picture, code, name, kind }]，code 可能为空（新版靠名字去 09 素材表对编号）
+ *  新规则包：`<Picture 5> E-02 正打机位基准图（其他）`（前缀 E-02 是场景，不是这张图的编号）
+ * 返回 [{ picture, code, name, label, kind }]：
+ *  - name 保留编号前缀，按「编号 → 名称」反查时整串去对（A-04 的正式名就是 `E-02正打机位基准图`）
+ *  - label 去掉前缀，只给显示用
  */
 function parsePictureBindings(line) {
   const found = [];
@@ -686,16 +690,15 @@ function parsePictureBindings(line) {
   let match;
   while ((match = re.exec(String(line || "")))) {
     const raw = String(match[2] || "").trim();
-    const codeMatch = raw.match(new RegExp(`(${STRUCT_CODE_RE})`, "i"));
+    // `宋阳（角色）` / `E-02 正打机位基准图（其他）`
+    const kindMatch = raw.match(/[（(]\s*([^）)]*)\s*[）)]\s*$/);
+    const kind = kindMatch ? String(kindMatch[1] || "").trim() : "";
+    const head = (kindMatch ? raw.slice(0, kindMatch.index) : raw).replace(/[·|｜、，,\s]+$/, "").trim();
+    const codeMatch = head.match(new RegExp(`(${STRUCT_CODE_RE})`, "i"));
     const code = codeMatch ? normalizeAssetCode(codeMatch[1]) : "";
-    let rest = codeMatch ? raw.replace(codeMatch[0], " ").trim() : raw;
-    rest = rest.replace(/^[·|｜、，,\s]+|[·|｜、，,\s]+$/g, "").trim();
-    // `宋阳（角色）` / `Song Yang (character)`
-    const named = rest.match(/^([^（(]+)[（(]\s*([^）)]*)\s*[）)]/);
-    const name = (named ? named[1] : rest).trim();
-    const kind = named ? String(named[2] || "").trim() : "";
-    if (!code && !name) continue;
-    found.push({ picture: Number(match[1]), code, name, kind });
+    const label = codeMatch ? head.replace(codeMatch[0], " ").replace(/\s+/g, " ").trim() : head;
+    if (!code && !head) continue;
+    found.push({ picture: Number(match[1]), code, name: head, label: label || head, kind });
   }
   return found.sort((a, b) => a.picture - b.picture);
 }
@@ -848,12 +851,13 @@ export function parseSegmentManifest(text) {
       const cells = line.split("|").map((cell) => cell.trim());
       if (cells.length < 11) return;
       const seg = cells[1] && cells[1].match(/^(\d{2})$/);
-      const range = cells[2] && cells[2].match(/^(\d{1,3})\s*[—–-]\s*(\d{1,3})$/);
+      // 镜头列可能是 `01—02`，也可能是单镜 `03`
+      const range = cells[2] && cells[2].match(/^(\d{1,3})(?:\s*[—–-]\s*(\d{1,3}))?$/);
       if (!seg || !range) return;
       rows.push({
         seg: seg[1],
         from: Number(range[1]),
-        to: Number(range[2]),
+        to: Number(range[2] || range[1]),
         shots: Number(cells[3]) || 0,
         seconds: Number(String(cells[4]).replace(/[^\d.]/g, "")) || 0,
         frames: Number(cells[5]) || 0,
@@ -866,7 +870,7 @@ export function parseSegmentManifest(text) {
   return rows;
 }
 
-/** 分段投喂契约自检（第 10 节）：段头镜数、[Shot N]、说话人上限、图位越界、切点时间码 */
+/** 分段投喂自检：段头镜数 / 切点 / 结尾时间 / 台词留白 / Subject 定义 / 保留分析 / 图位 / 帧秒自洽 */
 function validateSegmentUnits(units, warnings) {
   (units || []).forEach((unit) => {
     if (!unit.segment) return;
@@ -877,7 +881,13 @@ function validateSegmentUnits(units, warnings) {
     }
     const speakers = new Set((body.match(/\((S\d+)\)/g) || []).map((item) => item.slice(1, -1)));
     if (speakers.size > 2) warnings.push(`${unit.id} 有 ${speakers.size} 个说话人（上限 2）`);
-    if (Number(unit.duration) > 15.01) warnings.push(`${unit.id} 时长 ${unit.duration} 秒，超过单段 15 秒`);
+    const duration = Number(unit.duration) || 0;
+    if (duration > 15.01) warnings.push(`${unit.id} 时长 ${duration} 秒，超过单段 15 秒`);
+    // 帧与秒自洽：段头帧数 = round(秒 × 24)（130 帧 = 5.42 秒 ≈ 5.4 ✓）
+    const nominal = Number(unit.nominalFrames) || 0;
+    if (nominal && duration && Math.abs(nominal / 24 - duration) > 0.06) {
+      warnings.push(`${unit.id} 段头 ${nominal} 帧 ÷ 24 = ${(nominal / 24).toFixed(2)} 秒，与写的 ${duration} 秒不符`);
+    }
     const limit = (unit.assetBindings || []).length;
     if (limit) {
       const over = new Set();
@@ -892,17 +902,74 @@ function validateSegmentUnits(units, warnings) {
         warnings.push(`${unit.id} 用到 <Picture ${[...over].join(">、<Picture ")}>，但只绑了 ${limit} 张`);
       }
     }
-    // 切点是段内相对时间，必须严格递增且都落在段尾之前
-    const cuts = [];
-    body.replace(/At (\d{2}):(\d{2})\.(\d{3})/g, (_, m, s, ms) => {
-      cuts.push(Number(m) * 60 + Number(s) + Number(ms) / 1000);
+    const timeOf = (m, s, ms) => Number(m) * 60 + Number(s) + Number(ms) / 1000;
+    const label = (value) => `${String(Math.floor(value / 60)).padStart(2, "0")}:${(value % 60).toFixed(3).padStart(6, "0")}`;
+    // 段内时间码从 0 起算：首镜不许写「切到」，切点必须严格递增、都小于段长
+    const firstShot = body.match(/^\[Shot 1\][^\n]*/m);
+    if (firstShot && /At \d{2}:\d{2}\.\d{3}[^\n]*the camera cuts to/i.test(firstShot[0])) {
+      warnings.push(`${unit.id} 首镜 [Shot 1] 写了切点时间（段时间码应从 0 重算，改成开场机位描述）`);
+    }
+    const marks = [];
+    const timeRe = /At (\d{2}):(\d{2})\.(\d{3})/g;
+    let timeMatch;
+    while ((timeMatch = timeRe.exec(body))) {
+      const after = body.slice(timeMatch.index, timeMatch.index + 80);
+      marks.push({
+        value: timeOf(timeMatch[1], timeMatch[2], timeMatch[3]),
+        noCut: /no cut/i.test(after),
+      });
+    }
+    const cuts = marks.map((item) => item.value);
+    const realCuts = marks.filter((item) => !item.noCut).length;
+    // 切点数 = 镜数 − 1；写了「no cut」的连续镜不算切点
+    const expected = Math.max(0, shots - 1 - marks.filter((item) => item.noCut).length);
+    if (shots && realCuts !== expected) {
+      warnings.push(`${unit.id} 有 ${realCuts} 个切点，按 ${shots} 镜（扣掉 no cut）应为 ${expected} 个`);
+    }
+    if (cuts.some((value, index) => index > 0 && value <= cuts[index - 1])) {
+      warnings.push(`${unit.id} 段内时间码没有递增`);
+    }
+    const beyond = cuts.find((value) => duration && value >= duration);
+    if (beyond != null) {
+      warnings.push(`${unit.id} 时间码 ${label(beyond)} 超过段尾 ${duration} 秒`);
+    }
+    // 写了 `The shot ends at` 的段落，结尾时间必须正好是段长；没写不报
+    body.replace(/ends at (\d{2}):(\d{2})\.(\d{3})/g, (_, m, s, ms) => {
+      const end = timeOf(m, s, ms);
+      if (duration && Math.abs(end - duration) > 0.05) {
+        warnings.push(`${unit.id} 结尾时间 ${label(end)} 与段长 ${duration} 秒不符`);
+      }
       return "";
     });
-    if (cuts.some((value, index) => index > 0 && value <= cuts[index - 1])) {
-      warnings.push(`${unit.id} 切点时间码没有递增`);
+    // 台词收尾要留白：落点 ≤ 段长 − 0.5 秒
+    body.replace(/Complete the sentence by approximately (\d{2}):(\d{2})\.(\d{3})/g, (_, m, s, ms) => {
+      const land = timeOf(m, s, ms);
+      if (duration && land > duration - 0.5) {
+        warnings.push(`${unit.id} 台词落点 ${label(land)} 离段尾不足 0.5 秒（段长 ${duration} 秒）`);
+      }
+      return "";
+    });
+    // 保留分析：<Subject|Audio|Video> 行用段内镜号，不能超过本段镜数；<Picture> 行是全片镜号，跳过
+    const retention = String((unit.sections && unit.sections.retention_analysis) || "");
+    const retentionOver = [];
+    retention.split(/\r?\n/).forEach((line) => {
+      const text = line.trim();
+      if (!/^<(?:Subject|Audio|Video)\s+\d+>/i.test(text)) return;
+      [...text.matchAll(/\[Shot (\d+)\]/g)]
+        .map((item) => Number(item[1]))
+        .filter((no) => shots && no > shots)
+        .forEach((no) => retentionOver.push(no));
+    });
+    if (retentionOver.length) {
+      const unique = [...new Set(retentionOver)].sort((a, b) => a - b);
+      warnings.push(`${unit.id} 保留分析引用了本段不存在的 [Shot ${unique.join("]、[Shot ")}]（本段 ${shots} 镜）`);
     }
-    if (unit.duration && cuts.some((value) => value >= Number(unit.duration))) {
-      warnings.push(`${unit.id} 切点时间码超过段尾 ${unit.duration} 秒`);
+    // Subject 定义必须都在 subject_definitions 区，落在 summary 之后的单独报
+    const misplaced = ["summary", "retention_analysis", "detailed_description", "overall_soundscape", "non_diegetic_music"]
+      .map((key) => ((unit.sections && unit.sections[key]) || "").match(/^<Subject\s+\d+>\s+is\b/gm) || [])
+      .reduce((sum, list) => sum + list.length, 0);
+    if (misplaced) {
+      warnings.push(`${unit.id} 有 ${misplaced} 行 Subject 定义落在 subject_definitions 之后`);
     }
   });
 }
@@ -1001,7 +1068,7 @@ function parseStructuredPromptPack(text) {
           ? subject.name
           : subject.enName || subject.name
         : "";
-      const label = fromSubject || pic.name;
+      const label = fromSubject || pic.label || pic.name;
       if (label) assetNames[pic.code] = label;
     });
     const boundCodes = pictures.map((item) => item.code).filter(Boolean);
@@ -1079,6 +1146,8 @@ function parseStructuredPromptPack(text) {
       duration: nominal,
       // 分段投喂的段头帧数是名义值，已按 5+17n 向上吸附
       frames,
+      // 交付稿原始帧数（对账 / 帧秒自洽用）
+      nominalFrames: packFrames,
       alignedSeconds: meta ? Number(meta[5]) : 0,
       shot: "",
       camera: "",
