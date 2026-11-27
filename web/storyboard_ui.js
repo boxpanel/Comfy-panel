@@ -16,7 +16,7 @@ import {
   resolveAudioRefs,
   resolveBindingAssets,
   summarize,
-} from "./storyboard_parser.js?v=20261126a";
+} from "./storyboard_parser.js?v=20261128a";
 import {
   applyUnitParams,
   autoDetectTargets,
@@ -81,7 +81,7 @@ const STORAGE_KEY = "comfy.storyboard.panel.v1";
 const SETTINGS_REV = 3;
 // 面板版本号以插件 __version__ 为准，打开面板时从 /storyboard/version 取；
 // 下面的值只是后端接口不可用时（旧后端 / zip 安装）的占位
-let PANEL_VERSION = `v0.53.71 · 接点 · ${BRIDGE_BUILD}`;
+let PANEL_VERSION = `v0.53.72 · 接点 · ${BRIDGE_BUILD}`;
 const DRAFT_STEPS = 6;
 // 原生 Ref2V 没有 H3 计划节点，草稿靠降像素档：0.25MP 约等于 640×360
 const DRAFT_MEGAPIXELS = 0.25;
@@ -4780,13 +4780,20 @@ export function createStoryboardPanel(root, app) {
 
   function packKindOf(name, text) {
     const lower = String(name || "").toLowerCase();
-    const head = String(text || "").slice(0, 6000);
+    const whole = String(text || "");
+    const head = whole.slice(0, 6000);
+    const prefix = (String(name || "").match(/^(\d{2})[-_. ]/) || [])[1];
+    // 项目说明 / 讨论记录会整段引用单元稿与段头（86 个单元头 + 86 个 subject_definitions），
+    // 正文特征不可靠，这两类先按编号定死
+    if (prefix === "00" || prefix === "08") return PACK_FILE_KIND[prefix];
     // 先按正文认：出包端的编号含义会变（有的包里 04 是声音对白表，不是 04 镜表），
     // 只按前缀判会把附表当主源，整包解析出 0 镜
     // 解析契约是写给解析端的说明书，里面有段头 / 字段名的示例，不能被当成正文
     if (/分段投喂解析契约|解析契约/.test(head)) return "contract";
-    if (/^#{2,4}\s+段\s*\d{1,3}\s*[·・]\s*镜头/m.test(head) && /^subject_definitions:/m.test(head)) return "segments";
-    if (/^#{2,4}\s+(?:U\d{3}|镜\s*\d{3})\s*[·・]\s*镜头/m.test(head) && /^subject_definitions:/m.test(head)) return "units";
+    // 新包的 13 前面是一万多字的投喂说明，段头落在 6000 字之外，所以这两条扫全文；
+    // 段头 + subject_definitions 必须同时出现，对照说明不会被误判
+    if (/^#{2,4}\s+段\s*\d{1,3}\s*[·・]\s*镜头/m.test(whole) && /^subject_definitions:/m.test(whole)) return "segments";
+    if (/^#{2,4}\s+(?:U\d{3}|镜\s*\d{3})\s*[·・]\s*镜头/m.test(whole) && /^subject_definitions:/m.test(whole)) return "units";
     if (/\.json$/i.test(lower) || /^\uFEFF?\s*\{/.test(head)) return "json";
     if (/\.csv$/i.test(lower) || (/镜头号/.test(head.split(/\r?\n/, 1)[0] || "") && head.includes(","))) return "csv";
     if (/【镜头\s*\d+】/.test(head)) return "txt";
@@ -4796,7 +4803,6 @@ export function createStoryboardPanel(root, app) {
     if (/首帧提示词\s*[（(]/.test(head)) return "frames";
     if (/投喂段清单/.test(head)) return "manifest";
     if (/^#{1,3}\s*.*单元切分清单/m.test(head)) return "manifest";
-    const prefix = (String(name || "").match(/^(\d{2})[-_. ]/) || [])[1];
     if (prefix && PACK_FILE_KIND[prefix]) return PACK_FILE_KIND[prefix];
     if (/^#{1,6}\s*镜头\s*\d+/m.test(head)) return "shots";
     return "";
@@ -5135,6 +5141,17 @@ export function createStoryboardPanel(root, app) {
       }
       const voiced = resolveAudioRefs(state.doc.units, state.doc.assetNames);
       if (voiced) logLine(`已按名称补上 ${voiced} 条音色参考编号`, "ok");
+      // 图位在 03 里找不到编号时不能静默丢图：这些参考图会被跳过
+      const orphans = [];
+      state.doc.units.forEach((unit) => (unit.assetBindings || []).forEach((bind) => {
+        if (bind && !bind.code && bind.name) orphans.push(`${unit.id}「${bind.name}」`);
+      }));
+      if (orphans.length) {
+        logLine(
+          `有 ${orphans.length} 个图位在 03 素材表里找不到编号，这些图会被跳过：${orphans.slice(0, 4).join("、")}${orphans.length > 4 ? "…" : ""}`,
+          "warn"
+        );
+      }
       // 13 段清单：衔接列决定 17 / 20 / 25 / 30 接上一段尾帧，其余段首帧图锚定
       const manifestEntry = entries.find((entry) => entry.kind === "manifest");
       if (manifestEntry && state.doc.segmentContract) {

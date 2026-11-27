@@ -502,7 +502,9 @@ export function parseAssetNames(text) {
       .replace(/\s+/g, "");
     if (!clean) return;
     if (/^(的|与|和|在|到)/.test(clean)) return;
-    if (/三视图|参考|场景板|规格|静物|全身|表情|局部|可选|或用|优先|单元/.test(clean)) return;
+    // 只有整串就是标记词的才当占位名：新包的派生图名字本身就叫「…站位参考」「…关系参考」
+    if (/^(?:三视图|参考图?|场景板|全身|规格|静物|表情|局部|可选|或用|优先|单元)$/.test(clean)) return;
+    if (/三视图|静物|表情|局部|可选|或用|优先|单元/.test(clean)) return;
     if (!names[code]) names[code] = clean;
   };
 
@@ -591,7 +593,13 @@ export function resolveBindingAssets(units, nameMap) {
           (prefixes && candidates.find((code) => prefixes.some((p) => code.toUpperCase().startsWith(p)))) ||
           candidates[0];
       }
-      if (!pick && bind.code) pick = bind.code;
+      if (!pick && bind.code) {
+        // 兜底编号的前缀必须和类型对得上：`<Picture 8> E-02 床尾双人半身站位参考（其他）` 里的
+        // E-02 是场景编号，不是这张图的编号，直接兜底会把场景图顶掉、这张图丢掉
+        const prefixes = ASSET_KIND_PREFIX[bind.kind] || null;
+        if (!prefixes || prefixes.some((p) => String(bind.code).toUpperCase().startsWith(p))) pick = bind.code;
+      }
+      bind.code = pick || "";
       if (pick && !codes.includes(pick)) codes.push(pick);
     });
     if (!codes.length) return;
